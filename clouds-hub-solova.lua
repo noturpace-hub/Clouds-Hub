@@ -1,4 +1,4 @@
--- Clouds Hub Solova v13.1 (v9 base, verified cast, mobile cast fix)
+-- Clouds Hub Solova v1.4.0 (v13.1 + Halloween Pumpkin ESP)
 -- Requires executor support: getconnections, debug.getupvalues, debug.setupvalue, loadstring/HttpGet.
 getgenv().__SOLOVA_AUTOFISH = getgenv().__SOLOVA_AUTOFISH or {}
 local S = getgenv().__SOLOVA_AUTOFISH
@@ -6,12 +6,29 @@ local S = getgenv().__SOLOVA_AUTOFISH
 pcall(function() if S._conn then for _,c in ipairs(S._conn) do pcall(function() c:Disconnect() end) end end end)
 pcall(function() if S._thread then task.cancel(S._thread) end end)
 pcall(function() if S._ui and S._ui.Destroy then S._ui:Destroy() elseif S._ui and S._ui.Window and S._ui.Window.Destroy then S._ui.Window:Destroy() end end)
+pcall(function()
+    if S._esp then
+        if S._esp.conns then for _,c in ipairs(S._esp.conns) do pcall(function() c:Disconnect() end) end end
+        if S._esp.objects then
+            for _,o in pairs(S._esp.objects) do
+                pcall(function() if o.highlight then o.highlight:Destroy() end end)
+                pcall(function() if o.billboard then o.billboard:Destroy() end end)
+            end
+        end
+        if S._esp.folder then pcall(function() S._esp.folder:Destroy() end) end
+    end
+end)
 S._conn = {}
 S.running = false
 S.mode = S.mode or "V1"
 S.castDelay = tonumber(S.castDelay) or 5.0
 S.postMinigameDelay = tonumber(S.postMinigameDelay) or 1.8
 S.uiToggleKey = S.uiToggleKey or "G"
+S._esp = S._esp or { enabled = false }
+S._esp.enabled = false
+S._esp.objects = {}
+S._esp.conns = {}
+S._esp.folder = nil
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -137,7 +154,6 @@ end
 
 local function tryFireMobileSignals()
     if type(firesignal) ~= "function" then return false end
-    -- 1) TouchTapInWorld / TouchTap (mobile cast trigger)
     local function fireTouchWorld()
         local ok = false
         pcall(function()
@@ -156,8 +172,6 @@ local function tryFireMobileSignals()
         end
         return ok
     end
-
-    -- 2) InputBegan mouse-like (aman dicoba, diverifikasi)
     local function fireInputBeganMouse()
         local ok = pcall(function()
             firesignal(UIS.InputBegan, { UserInputType = Enum.UserInputType.MouseButton1, UserInputState = Enum.UserInputState.Begin, Position = Vector3.new(0,0,0), Delta = Vector3.new(0,0,0), KeyCode = Enum.KeyCode.Unknown }, false)
@@ -168,8 +182,6 @@ local function tryFireMobileSignals()
         end
         return ok
     end
-
-    -- 3) Mobile FishButton (Activated/InputBegan)
     local function fireFishButton()
         local pg = lp:FindFirstChild("PlayerGui")
         local ui = pg and pg:FindFirstChild("FishingKitUI")
@@ -186,8 +198,6 @@ local function tryFireMobileSignals()
         end
         return any
     end
-
-    -- 4) Tool Activated
     local function fireToolActivated()
         local char = lp.Character
         if not char then return false end
@@ -198,7 +208,6 @@ local function tryFireMobileSignals()
         pcall(function() if tool.Activated then firesignal(tool.Activated) ok = true end end)
         return ok
     end
-
     local did = false
     if fireTouchWorld() then did = true end
     if not isCastStarted() then if fireInputBeganMouse() then did = true end end
@@ -209,7 +218,6 @@ local function tryFireMobileSignals()
 end
 
 local function triggerCast()
-    -- 1) Cast internal (paling stabil, laptop/PC)
     local cast = findCastFunction(false)
     if not cast then cast = findCastFunction(true) end
     if type(cast) == "function" then
@@ -220,8 +228,6 @@ local function triggerCast()
             S._castFn = nil
         end
     end
-
-    -- 2) VirtualInputManager (diverifikasi)
     local okV = pcall(function()
         local cam = workspace.CurrentCamera
         local vs = cam and cam.ViewportSize or Vector2.new(800, 600)
@@ -231,16 +237,11 @@ local function triggerCast()
         VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
     if okV and verifyCast(IS_MOBILE and 0.8 or 0.7) then return true, "vim-click" end
-
-    -- 3) firesignal (khusus penting untuk Android/iOS; semua diverifikasi)
     if tryFireMobileSignals() then return true, "firesignal" end
-
-    -- 4) mouse1click (PC, butuh fokus)
     if not IS_MOBILE then
         local okM = pcall(function() mouse1click() end)
         if okM and verifyCast(0.9) then return true, "mouse1click" end
     end
-
     return false, "Cast tidak terverifikasi/gagal. Pastikan rod equipped & area bisa mancing. (Android: coba V2 manual sekali jika tetap gagal)"
 end
 
@@ -280,6 +281,138 @@ local function applyToggleKey(win, v)
     pcall(function() win:SetToggleKey(Enum.KeyCode[keyName]) end)
 end
 
+-- ===== Halloween Pumpkin ESP (Labu A-I in Workspace.LabuAktif) =====
+local function getEspParent()
+    local ok, hui = pcall(function() return gethui and gethui() end)
+    if ok and hui then return hui end
+    local cg = pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui") or nil
+    if cg then return cg end
+    return lp:FindFirstChildOfClass("PlayerGui")
+end
+
+local function clearPumpkinESP()
+    if S._esp and S._esp.conns then
+        for _,c in ipairs(S._esp.conns) do pcall(function() c:Disconnect() end) end
+    end
+    S._esp.conns = {}
+    if S._esp and S._esp.objects then
+        for _,o in pairs(S._esp.objects) do
+            pcall(function() if o.highlight then o.highlight:Destroy() end end)
+            pcall(function() if o.billboard then o.billboard:Destroy() end end)
+        end
+    end
+    S._esp.objects = {}
+    if S._esp and S._esp.folder then pcall(function() S._esp.folder:Destroy() end) end
+    S._esp.folder = nil
+end
+
+local function addPumpkinESP(part)
+    if not part or not part.Parent then return end
+    if not (part:IsA("BasePart") or part:IsA("MeshPart")) then return end
+    local name = part.Name or "Labu"
+    if S._esp.objects[part] then return end
+    local parentGui = getEspParent()
+    if not parentGui then return end
+    if not S._esp.folder or not S._esp.folder.Parent then
+        local f = Instance.new("Folder")
+        f.Name = "CloudsHub_LabuESP"
+        pcall(function() f.Parent = parentGui end)
+        S._esp.folder = f
+    end
+    local hl = Instance.new("Highlight")
+    hl.Name = "LabuHighlight"
+    hl.Adornee = part
+    hl.FillColor = Color3.fromRGB(255, 140, 0)
+    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+    hl.FillTransparency = 0.5
+    hl.OutlineTransparency = 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    pcall(function() hl.Parent = S._esp.folder end)
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "LabuBillboard"
+    bb.Adornee = part
+    bb.Size = UDim2.new(0, 140, 0, 40)
+    bb.StudsOffset = Vector3.new(0, 3.5, 0)
+    bb.AlwaysOnTop = true
+    bb.LightInfluence = 0
+    pcall(function() bb.Parent = S._esp.folder end)
+
+    local tl = Instance.new("TextLabel")
+    tl.Name = "Label"
+    tl.BackgroundTransparency = 1
+    tl.Size = UDim2.new(1, 0, 1, 0)
+    tl.Text = "🎃 " .. name
+    tl.TextColor3 = Color3.fromRGB(255, 200, 60)
+    tl.TextStrokeTransparency = 0.2
+    tl.TextStrokeColor3 = Color3.new(0,0,0)
+    tl.TextScaled = true
+    tl.Font = Enum.Font.GothamBold
+    tl.Parent = bb
+
+    S._esp.objects[part] = { highlight = hl, billboard = bb }
+end
+
+local function removePumpkinESP(part)
+    local o = S._esp and S._esp.objects and S._esp.objects[part]
+    if not o then return end
+    pcall(function() if o.highlight then o.highlight:Destroy() end end)
+    pcall(function() if o.billboard then o.billboard:Destroy() end end)
+    S._esp.objects[part] = nil
+end
+
+local function refreshPumpkinESP()
+    local folder = workspace:FindFirstChild("LabuAktif")
+    if not folder then return end
+    for _,ch in ipairs(folder:GetChildren()) do
+        if ch:IsA("BasePart") then addPumpkinESP(ch) end
+    end
+    -- remove ESP for parts no longer in LabuAktif
+    for part,_ in pairs(S._esp.objects) do
+        if not part or not part.Parent or part.Parent ~= folder then
+            removePumpkinESP(part)
+        end
+    end
+end
+
+local function setPumpkinESP(enabled)
+    S._esp.enabled = enabled and true or false
+    clearPumpkinESP()
+    S._esp.enabled = enabled and true or false
+    if not S._esp.enabled then return end
+    local folder = workspace:FindFirstChild("LabuAktif")
+    if folder then
+        refreshPumpkinESP()
+        local c1 = folder.ChildAdded:Connect(function(ch)
+            if not S._esp.enabled then return end
+            task.wait(0.05)
+            if ch and ch.Parent == folder and ch:IsA("BasePart") then addPumpkinESP(ch) end
+        end)
+        local c2 = folder.ChildRemoved:Connect(function(ch)
+            removePumpkinESP(ch)
+        end)
+        table.insert(S._esp.conns, c1); table.insert(S._esp.conns, c2)
+        table.insert(S._conn, c1); table.insert(S._conn, c2)
+    end
+    -- also watch for LabuAktif folder appearing later
+    local c3 = workspace.ChildAdded:Connect(function(ch)
+        if ch.Name == "LabuAktif" and ch:IsA("Folder") and S._esp.enabled then
+            task.wait(0.1)
+            refreshPumpkinESP()
+            local a = ch.ChildAdded:Connect(function(x)
+                if not S._esp.enabled then return end
+                task.wait(0.05)
+                if x and x.Parent == ch and x:IsA("BasePart") then addPumpkinESP(x) end
+            end)
+            local b = ch.ChildRemoved:Connect(function(x) removePumpkinESP(x) end)
+            table.insert(S._esp.conns, a); table.insert(S._esp.conns, b)
+            table.insert(S._conn, a); table.insert(S._conn, b)
+        end
+    end)
+    table.insert(S._esp.conns, c3); table.insert(S._conn, c3)
+end
+-- ===== end Pumpkin ESP =====
+
 local okUI, WindUI = pcall(function()
     return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
 end)
@@ -290,11 +423,11 @@ end
 S.WindUI = WindUI
 
 local Window = WindUI:CreateWindow({
-    Title = "Clouds Hub Solova V1.3.1",
+    Title = "Clouds Hub Solova V1.4.0",
     Icon = "fish",
     Author = "[🎃] Solova Hangout || Private use only!",
     Folder = "SolovaAutoFish",
-    Size = UDim2.fromOffset(460, 400),
+    Size = UDim2.fromOffset(460, 420),
     MinSize = Vector2.new(320, 320),
     MaxSize = Vector2.new(760, 560),
     Transparent = true,
@@ -318,6 +451,7 @@ S._ui = Window
 pcall(function() applyToggleKey(Window, S.uiToggleKey or "G") end)
 
 local TabMemancing = Window:Tab({ Title = "Memancing", Icon = "anchor" })
+local TabHalloween = Window:Tab({ Title = "Halloween", Icon = "ghost" })
 local TabPengaturan = Window:Tab({ Title = "Pengaturan", Icon = "settings" })
 
 local statusPara
@@ -443,6 +577,20 @@ TabMemancing:Slider({
     Callback = function(v) local n = tonumber(v) if n then S.castDelay = math.clamp(n, 2, 15) end end
 })
 
+TabHalloween:Paragraph({
+    Title = "ESP Labu (Pumpkin)",
+    Desc = "Menandai Labu A–I yang sedang aktif/spawn di map (Workspace.LabuAktif). Tanpa teleport/autorun."
+})
+
+TabHalloween:Toggle({
+    Title = "Pumpkin ESP",
+    Desc = "Highlight + label 🎃 untuk semua labu aktif. Update otomatis saat spawn/despawn.",
+    Value = false,
+    Callback = function(state)
+        setPumpkinESP(state)
+    end
+})
+
 TabPengaturan:Paragraph({ Title = "UI", Desc = "Di HP, gunakan tombol 'Clouds Hub' (draggable) untuk buka/tutup UI. Keybind keyboard berguna di PC." })
 
 TabPengaturan:Keybind({
@@ -464,4 +612,4 @@ local hb = RunService.Heartbeat:Connect(function()
 end)
 table.insert(S._conn, hb)
 
-print("[CloudsHub] loaded v13.1 (v9 base + verified cast, mobile firesignal fix)")
+print("[CloudsHub] loaded v1.4.0 (fishing + Halloween Pumpkin ESP)")
