@@ -1,4 +1,4 @@
--- Clouds Hub Solova v13 (based on v9, crash-safe + verified cast)
+-- Clouds Hub Solova v13.1 (v9 base, verified cast, mobile cast fix)
 -- Requires executor support: getconnections, debug.getupvalues, debug.setupvalue, loadstring/HttpGet.
 getgenv().__SOLOVA_AUTOFISH = getgenv().__SOLOVA_AUTOFISH or {}
 local S = getgenv().__SOLOVA_AUTOFISH
@@ -18,11 +18,11 @@ local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local VIM = game:GetService("VirtualInputManager")
+local GuiService = game:GetService("GuiService")
 local lp = Players.LocalPlayer
 
 local IS_MOBILE = (UIS.TouchEnabled and not UIS.KeyboardEnabled)
 
--- Popup notif dimatikan (biar layar tidak penuh)
 local function notify(title, msg)
 end
 
@@ -57,8 +57,11 @@ end
 
 local function findCastFunction(force)
     if not force and type(S._castFn) == "function" then return S._castFn end
+    local signals = { UIS.InputBegan }
+    pcall(function() if UIS.TouchTapInWorld then table.insert(signals, UIS.TouchTapInWorld) end end)
+    pcall(function() if UIS.TouchTap then table.insert(signals, UIS.TouchTap) end end)
     local ok, res = pcall(function()
-        for _,sig in ipairs({ UIS.InputBegan }) do
+        for _,sig in ipairs(signals) do
             local connsOk, conns = pcall(getconnections, sig)
             if connsOk and type(conns) == "table" then
                 for _,c in ipairs(conns) do
@@ -72,6 +75,7 @@ local function findCastFunction(force)
                                 end
                             end
                         end
+                        if _looksLikeCast(fn) then return fn end
                     end
                 end
             end
@@ -131,35 +135,113 @@ local function verifyCast(timeoutSec)
     return isCastStarted()
 end
 
+local function tryFireMobileSignals()
+    if type(firesignal) ~= "function" then return false end
+    -- 1) TouchTapInWorld / TouchTap (mobile cast trigger)
+    local function fireTouchWorld()
+        local ok = false
+        pcall(function()
+            if UIS.TouchTapInWorld then
+                firesignal(UIS.TouchTapInWorld, Vector2.new(400, 300), false)
+                ok = true
+            end
+        end)
+        if not ok then
+            pcall(function()
+                if UIS.TouchTap then
+                    firesignal(UIS.TouchTap, { { Position = Vector2.new(400, 300) } }, false)
+                    ok = true
+                end
+            end)
+        end
+        return ok
+    end
+
+    -- 2) InputBegan mouse-like (aman dicoba, diverifikasi)
+    local function fireInputBeganMouse()
+        local ok = pcall(function()
+            firesignal(UIS.InputBegan, { UserInputType = Enum.UserInputType.MouseButton1, UserInputState = Enum.UserInputState.Begin, Position = Vector3.new(0,0,0), Delta = Vector3.new(0,0,0), KeyCode = Enum.KeyCode.Unknown }, false)
+        end)
+        if ok then
+            task.wait(0.03)
+            pcall(function() firesignal(UIS.InputEnded, { UserInputType = Enum.UserInputType.MouseButton1, UserInputState = Enum.UserInputState.End, Position = Vector3.new(0,0,0), Delta = Vector3.new(0,0,0), KeyCode = Enum.KeyCode.Unknown }, false) end)
+        end
+        return ok
+    end
+
+    -- 3) Mobile FishButton (Activated/InputBegan)
+    local function fireFishButton()
+        local pg = lp:FindFirstChild("PlayerGui")
+        local ui = pg and pg:FindFirstChild("FishingKitUI")
+        local mobile = ui and ui:FindFirstChild("Mobile")
+        local root = mobile and (mobile:FindFirstChild("FishButton") or mobile)
+        if not root then return false end
+        local targets = { root }
+        for _,d in ipairs(root:GetDescendants()) do table.insert(targets, d) end
+        local any = false
+        for _,t in ipairs(targets) do
+            pcall(function() if t.Activated then firesignal(t.Activated) any = true end end)
+            pcall(function() if t.InputBegan then firesignal(t.InputBegan, { UserInputType = Enum.UserInputType.Touch, UserInputState = Enum.UserInputState.Begin, Position = Vector3.new(0,0,0), Delta = Vector3.new(0,0,0), KeyCode = Enum.KeyCode.Unknown }, false) any = true end end)
+            pcall(function() if t.MouseButton1Down then firesignal(t.MouseButton1Down) any = true end end)
+        end
+        return any
+    end
+
+    -- 4) Tool Activated
+    local function fireToolActivated()
+        local char = lp.Character
+        if not char then return false end
+        local tool
+        for _,v in ipairs(char:GetChildren()) do if v:IsA("Tool") and string.find(v.Name,"Rod") then tool=v break end end
+        if not tool then return false end
+        local ok = false
+        pcall(function() if tool.Activated then firesignal(tool.Activated) ok = true end end)
+        return ok
+    end
+
+    local did = false
+    if fireTouchWorld() then did = true end
+    if not isCastStarted() then if fireInputBeganMouse() then did = true end end
+    if not isCastStarted() then if fireFishButton() then did = true end end
+    if not isCastStarted() then if fireToolActivated() then did = true end end
+    if not did then return false end
+    return verifyCast(IS_MOBILE and 1.0 or 0.9)
+end
+
 local function triggerCast()
-    -- 1) Coba fungsi Cast internal game (kalau ketemu) - paling stabil
+    -- 1) Cast internal (paling stabil, laptop/PC)
     local cast = findCastFunction(false)
     if not cast then cast = findCastFunction(true) end
     if type(cast) == "function" then
         local ok = pcall(cast)
         if ok then
             if verifyCast(IS_MOBILE and 0.8 or 0.7) then return true, "cast-internal" end
-            -- jika belum terverifikasi, jangan klaim sukses palsu; coba fallback
         else
             S._castFn = nil
         end
     end
 
-    -- 2) Fallback: VirtualInputManager (diverifikasi, anti loop false-positive)
+    -- 2) VirtualInputManager (diverifikasi)
     local okV = pcall(function()
-        VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+        local cam = workspace.CurrentCamera
+        local vs = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local x, y = math.floor(vs.X * 0.5), math.floor(vs.Y * 0.5)
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
         task.wait(0.03)
-        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
-    if okV and verifyCast(IS_MOBILE and 0.9 or 0.8) then return true, "vim-click" end
+    if okV and verifyCast(IS_MOBILE and 0.8 or 0.7) then return true, "vim-click" end
 
-    -- 3) Fallback PC: mouse1click (butuh fokus window di PC)
+    -- 3) firesignal (khusus penting untuk Android/iOS; semua diverifikasi)
+    if tryFireMobileSignals() then return true, "firesignal" end
+
+    -- 4) mouse1click (PC, butuh fokus)
     if not IS_MOBILE then
         local okM = pcall(function() mouse1click() end)
         if okM and verifyCast(0.9) then return true, "mouse1click" end
     end
 
-    return false, "Cast tidak terverifikasi/gagal. Pastikan rod equipped (PC: fokus Roblox jika pakai fallback)."
+    return false, "Cast tidak terverifikasi/gagal. Pastikan rod equipped & area bisa mancing. (Android: coba V2 manual sekali jika tetap gagal)"
 end
 
 local function steerMinigame(rf)
@@ -195,12 +277,7 @@ local function applyToggleKey(win, v)
     if type(v) ~= "string" then keyName = tostring(v) end
     if not keyName or keyName == "" then keyName = "G" end
     S.uiToggleKey = keyName
-    local ok, err = pcall(function()
-        win:SetToggleKey(Enum.KeyCode[keyName])
-    end)
-    if not ok then
-        warn("[CloudsHub] Gagal set keybind UI:", err)
-    end
+    pcall(function() win:SetToggleKey(Enum.KeyCode[keyName]) end)
 end
 
 local okUI, WindUI = pcall(function()
@@ -213,7 +290,7 @@ end
 S.WindUI = WindUI
 
 local Window = WindUI:CreateWindow({
-    Title = "Clouds Hub Solova",
+    Title = "Clouds Hub Solova V1.3.1",
     Icon = "fish",
     Author = "[🎃] Solova Hangout || Private use only!",
     Folder = "SolovaAutoFish",
@@ -264,7 +341,7 @@ statusPara = TabMemancing:Paragraph({ Title = "Status", Desc = "Mode: " .. tostr
 
 TabMemancing:Toggle({
     Title = "Auto Fishing",
-    Desc = "V1: auto cast + auto minigame. V2: hanya auto minigame saat assist aktif. Cast diverifikasi (anti loop).",
+    Desc = "V1: auto cast + auto minigame. V2: hanya auto minigame. Cast diverifikasi (anti loop).",
     Value = false,
     Callback = function(state)
         S.running = state
@@ -379,7 +456,6 @@ TabPengaturan:Keybind({
 
 local hb = RunService.Heartbeat:Connect(function()
     if not S.running then return end
-    -- throttle ringan untuk kurangi beban di semua platform
     local now = os.clock()
     if S._lastHbSteer and (now - S._lastHbSteer) < 0.04 then return end
     S._lastHbSteer = now
@@ -388,4 +464,4 @@ local hb = RunService.Heartbeat:Connect(function()
 end)
 table.insert(S._conn, hb)
 
-print("[CloudsHub] loaded v13 (v9 base + verified cast, crash-safe)")
+print("[CloudsHub] loaded v13.1 (v9 base + verified cast, mobile firesignal fix)")
