@@ -1,5 +1,5 @@
 --[[============================================================================
-    Clouds Hub V3.0.0 — [🎃] Solova Hangout (placeId 117700301942271)
+    Clouds Hub V3.0.1 — [🎃] Solova Hangout (placeId 117700301942271)
 
     REWRITE PENUH (bukan kelanjutan v1/v2). Metode mancing baru yang
     crash-safe:
