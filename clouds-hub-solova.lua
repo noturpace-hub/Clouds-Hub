@@ -1,5 +1,5 @@
 --[[============================================================================
-    Clouds Hub V3.0.1 — [🎃] Solova Hangout (placeId 117700301942271)
+    Clouds Hub V3.1.0 — [🎃] Solova Hangout (placeId 117700301942271)
 
     REWRITE PENUH (bukan kelanjutan v1/v2). Metode mancing baru yang
     crash-safe:
@@ -20,7 +20,7 @@
     Pengaturan (Anti-AFK, keybind UI, tombol pill draggable).
 ============================================================================]]
 
-print("[CloudsHub] memuat V3.0.1 ...")
+print("[CloudsHub] memuat V3.1.0 ...")
 
 -- ===== 0. Cleanup instance lama ============================================
 local genv = getgenv and getgenv() or _G
@@ -48,7 +48,7 @@ local CollectionService = game:GetService("CollectionService")
 local lp = Players.LocalPlayer
 
 local S = {
-    version = "3.0.1",
+    version = "3.1.0",
     -- fishing
     running = false,
     mode = "Full",            -- "Full" (auto cast + steer) | "Assist" (steer saja)
@@ -57,7 +57,7 @@ local S = {
     autoEquip = true,
     castDelay = 9.0,          -- jeda antar cast / retry (detik)
     postMinigameDelay = 1.8,  -- jeda setelah minigame selesai (detik)
-    biteTimeout = 45,         -- maks menunggu gigitan sebelum cast ulang
+    biteTimeout = 120,        -- maks menunggu gigitan sebelum cast ulang (rod jelek = bite lama)
     -- lain
     antiAfk = false,
     uiToggleKey = "F",
@@ -75,6 +75,8 @@ local S = {
     _steerWarned = false,
     _biteWaitUntil = 0,
     _castConfirmed = false,
+    _castFailures = 0,      -- cast gagal terkonfirmasi berturut-turut (memutar urutan metode)
+    _lastCastMethod = nil,
 }
 local Window = nil -- diisi saat UI jadi; dibaca Unload
 
@@ -117,7 +119,11 @@ local function isRod(tool)
     end)
     if ok and tagged then return true end
     local n = string.lower(tostring(tool.Name))
-    return string.find(n, "rod", 1, true) ~= nil
+    -- beberapa platform/paket rod pakai nama lain (mis. iOS: rod berbeda)
+    for _, h in ipairs({ "rod", "pancing", "fishing" }) do
+        if string.find(n, h, 1, true) then return true end
+    end
+    return false
 end
 
 -- ===== 3. Modul input (VIM + fallback) =====================================
@@ -179,34 +185,123 @@ local function inputRelease()
     end
 end
 
--- Klik cast: prioritaskan tombol Mobile game bila tampil (posisinya pasti
--- benar), else klik area layar tengah. Selalu tekan-lepas singkat.
+-- Trigger sinyal tombol (untuk executor iOS/Android yang support getconnections
+-- /firesignal — VirtualInputManager mouse kadang tidak dianggap touch di sana).
+local function fireFirstSignal(btn, names)
+    if type(getconnections) == "function" then
+        for _, n in ipairs(names) do
+            local ok, sig = pcall(function() return btn[n] end)
+            if ok and sig then
+                local cons
+                pcall(function() cons = getconnections(sig) end)
+                if cons then
+                    for _, c in ipairs(cons) do
+                        if c.Function then
+                            local okF = pcall(function() c:Fire() end)
+                            if okF then return "signal:" .. n end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if type(firesignal) == "function" then
+        for _, n in ipairs(names) do
+            local ok, sig = pcall(function() return btn[n] end)
+            if ok and sig then
+                local okF = pcall(function() firesignal(sig) end)
+                if okF then return "firesignal:" .. n end
+            end
+        end
+    end
+    return nil
+end
+
+-- Satu percobaan cast dengan metode tertentu. Return nama metode bila aksi
+-- terkirim, nil bila metode tidak tersedia/gagal.
+local function tryCastMethod(m, fb)
+    if m == "signal" then
+        return fireFirstSignal(fb, { "Activated", "MouseButton1Click" })
+    elseif m == "mobile-vim" then
+        local p, sz = fb.AbsolutePosition, fb.AbsoluteSize
+        local x, y = p.X + sz.X * 0.5, p.Y + sz.Y * 0.5
+        vimMouse(true, x, y)
+        task.wait(0.04)
+        vimMouse(false, x, y)
+        return vim and "mobile-vim" or nil
+    elseif m == "vim" then
+        local x, y = viewportPoint()
+        vimMouse(true, x, y)
+        task.wait(0.04)
+        vimMouse(false, x, y)
+        return vim and "vim" or nil
+    elseif m == "press" then
+        if type(mouse1press) == "function" and type(mouse1release) == "function" then
+            pcall(mouse1press)
+            task.wait(0.05)
+            pcall(mouse1release)
+            return "press"
+        end
+        return nil
+    elseif m == "mouse1click" then
+        if type(mouse1click) == "function" then
+            pcall(mouse1click)
+            return "mouse1click"
+        end
+        return nil
+    end
+    return nil
+end
+
+-- Klik cast. Urutan metode menyesuaikan device: iOS/Android (TouchEnabled +
+-- tombol mobile tampil) mencoba sinyal tombol dulu; PC memakai jalur VIM yang
+-- sudah terbukti. Metode yang gagal dikonfirmasi game akan dilewati pada
+-- percobaan berikutnya (rotasi otomatis), dan tiap metode tercatat di log
+-- supaya kegagalan cast di device tertentu gampang didiagnosa.
 local function castClick()
     local now = os.clock()
     if now - (S._lastCastClick or 0) < 2 then return false end
     S._lastCastClick = now
-    local ok = pcall(function()
-        local targetX, targetY
-        local pg = lp:FindFirstChildOfClass("PlayerGui")
-        local ui = pg and pg:FindFirstChild("FishingKitUI")
-        local mob = ui and ui:FindFirstChild("Mobile")
-        local fb = mob and mob:FindFirstChild("FishButton")
-        if mob and mob.Visible and fb and fb.Visible then
-            local p, sz = fb.AbsolutePosition, fb.AbsoluteSize
-            targetX = p.X + sz.X * 0.5
-            targetY = p.Y + sz.Y * 0.5
+
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    local ui = pg and pg:FindFirstChild("FishingKitUI")
+    local mob = ui and ui:FindFirstChild("Mobile")
+    local fb = mob and mob:FindFirstChild("FishButton")
+    local mobileVisible = (mob and mob.Visible and fb and fb.Visible) or false
+
+    local touch = false
+    pcall(function() touch = UserInputService.TouchEnabled end)
+
+    local candidates
+    if mobileVisible then
+        if touch then
+            candidates = { "signal", "mobile-vim", "press", "mouse1click" }
         else
-            targetX, targetY = viewportPoint()
+            candidates = { "mobile-vim", "press", "mouse1click" }
         end
-        vimMouse(true, targetX, targetY)
-        task.wait(0.04)
-        vimMouse(false, targetX, targetY)
-    end)
-    if ok and vim then return true end
-    if type(mouse1click) == "function" then
-        pcall(mouse1click)
-        return true
+    else
+        candidates = { "vim", "press", "mouse1click" }
     end
+
+    local nF = tonumber(S._castFailures) or 0
+    local start = 1 + (nF % #candidates)
+
+    local used = {}
+    for i = 0, #candidates - 1 do
+        local idx = ((start + i - 1) % #candidates) + 1
+        local m = candidates[idx]
+        if not used[m] then
+            used[m] = true
+            local ok, method = pcall(tryCastMethod, m, fb)
+            if ok and method then
+                S._lastCastMethod = method
+                print("[CloudsHub][cast] method=" .. tostring(method) .. " fail#" .. nF)
+                return true
+            end
+        end
+    end
+    S._lastCastMethod = "NONE"
+    print("[CloudsHub][cast] method=NONE (tidak ada metode input yang tersedia)")
     return false
 end
 
@@ -227,7 +322,18 @@ local function ensureRodEquipped()
             best = best or t
         end
     end
+    if not best then
+        -- fallback terakhir (mis. iOS: rod dengan nama tak dikenal): tool pertama di backpack
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") then
+                best = t
+                warn("[CloudsHub][equip] rod tak terdeteksi via tag/nama, pakai tool pertama: " .. tostring(t.Name))
+                break
+            end
+        end
+    end
     if not best then return false end
+    print("[CloudsHub][equip] rod=" .. tostring(best.Name))
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     if not hum then return false end
     pcall(function() hum:EquipTool(best) end)
@@ -407,22 +513,24 @@ local function fishingStep()
         return 0.6
     end
 
-    -- verifikasi cast: harus muncul busy/minigame dalam 3s
-    local deadline = os.clock() + 3
+    -- verifikasi cast: harus muncul busy/minigame dalam 5s (device lambat aman)
+    local deadline = os.clock() + 5
     while os.clock() < deadline and S.running and S._alive do
         task.wait(0.2)
         local hm2 = getHoldMinigame()
         if (hm2 and hm2.Enabled) or isBusy() then
             S._wasBusy = true
             S._castConfirmed = true
-            S._biteWaitUntil = os.clock() + (tonumber(S.biteTimeout) or 45)
+            S._castFailures = 0
+            S._biteWaitUntil = os.clock() + (tonumber(S.biteTimeout) or 120)
             S._nextCastAt = os.clock() + (tonumber(S.castDelay) or 9.0)
-            setStatus("Cast OK — menunggu ikan...")
+            setStatus("Cast OK (" .. tostring(S._lastCastMethod) .. ") — menunggu ikan...")
             return 0.2
         end
     end
+    S._castFailures = (S._castFailures or 0) + 1
     S._nextCastAt = os.clock() + (tonumber(S.castDelay) or 9.0)
-    setStatus("Cast tidak terkonfirmasi, retry nanti")
+    setStatus("Cast gagal (method=" .. tostring(S._lastCastMethod) .. "), retry nanti")
     return 0.4
 end
 
@@ -764,7 +872,7 @@ pcall(function()
 end)
 
 Window = WindUI:CreateWindow({
-    Title = "Clouds Hub V3.0.1",
+    Title = "Clouds Hub V3.1.0",
     SubTitle = "Solova Hangout",
     Icon = "cloud",
     Author = "Clouds Hub",
@@ -825,6 +933,7 @@ TabMemancing:Toggle({
             S._wasBusy = false
             S._sawMinigame = false
             S._castConfirmed = false
+            S._castFailures = 0
             S._biteWaitUntil = 0
             S._nextCastAt = os.clock() + 1
             setStatus("Mode: " .. S.mode .. " | Berjalan")
@@ -902,12 +1011,12 @@ TabMemancing:Slider({
 
 TabMemancing:Slider({
     Title = "Bite Timeout (detik)",
-    Desc = "Maksimal menunggu gigitan sebelum cast ulang (anti double-cast).",
-    Step = 1,
-    Value = { Min = 10, Max = 120, Default = tonumber(S.biteTimeout) },
+    Desc = "Maksimal menunggu gigitan sebelum cast ulang. Rod jelek = bite lama = naikkan.",
+    Step = 5,
+    Value = { Min = 30, Max = 300, Default = tonumber(S.biteTimeout) },
     Callback = function(v)
         local n = tonumber(v)
-        if n then S.biteTimeout = math.clamp(n, 10, 120) end
+        if n then S.biteTimeout = math.clamp(n, 30, 300) end
     end,
 })
 
@@ -1148,4 +1257,4 @@ genv.__CLOUDS_HUB_V3 = S
 -- Default Anti-AFK ON (untuk AFK mancing)
 setAntiAfk(true)
 
-print("[CloudsHub] loaded V3.0.1 — input-only auto fishing (tanpa debug hook), UI biru langit")
+print("[CloudsHub] loaded V3.1.0 — input-only auto fishing (tanpa debug hook), UI biru langit")
