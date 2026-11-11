@@ -1,776 +1,1151 @@
--- Clouds Hub Solova v2.3.4 (AFK terpadu: auto-equip+cast+steer, cast input stabil tanpa loop)
--- Prioritas: Auto Cast + Auto Steer berjalan bersama untuk AFK. Mekanik berdasarkan FishingKit game (controller/RodFunctions, minigame input arah).
+--[[============================================================================
+    Clouds Hub V3.0.0 — [🎃] Solova Hangout (placeId 117700301942271)
 
-getgenv().__CLOUDS_HUB = getgenv().__CLOUDS_HUB or {}
-local S = getgenv().__CLOUDS_HUB
+    REWRITE PENUH (bukan kelanjutan v1/v2). Metode mancing baru yang
+    crash-safe:
+      - TANPA debug hook sama sekali (tidak ada getupvalue/setupvalue,
+        tidak ada scan getconnections, tidak ada patched function).
+      - Cast  : satu klik terkontrol (tombol Mobile game bila tampil,
+                else klik layar) via VirtualInputManager + fallback
+                mouse1click executor.
+      - Steer : minigame "Klik & Tahan" dikendalikan dari sisi INPUT:
+                baca posisi ikan vs zona dari GUI HoldMinigame tiap
+                Heartbeat (throttled), tahan/lepas (Mouse / Space) sesuai
+                posisi ikan. Koneksi Heartbeat tunggal, dibuka-tutup
+                bersih, semua pcall.
+      - Cross-platform: PC + iOS/Android (VIM atau fallback executor).
+    Fitur: Memancing (Full Auto / Assist, auto equip, delay 0.1-step),
+    Halloween (Pumpkin ESP LabuAktif + Auto Run ke Labu pathfinding),
+    Player (Spectate dropdown/next/prev/stop, follow respawn),
+    Pengaturan (Anti-AFK, keybind UI, tombol pill draggable).
+============================================================================]]
 
--- ===== cleanup =====
-pcall(function() if S._conns then for _, c in ipairs(S._conns) do pcall(function() c:Disconnect() end) end end end)
-pcall(function() if S._autorunThread then task.cancel(S._autorunThread) end end)
-pcall(function() if S._ui and S._ui.Destroy then S._ui:Destroy() end end)
-pcall(function() local cg = game:GetService("CoreGui"); local old = cg:FindFirstChild("CloudsHub_ToggleGui"); if old then old:Destroy() end end)
+print("[CloudsHub] memuat V3.0.1 ...")
+
+-- ===== 0. Cleanup instance lama ============================================
+local genv = getgenv and getgenv() or _G
+if genv.__CLOUDS_HUB_V3 and type(genv.__CLOUDS_HUB_V3.Unload) == "function" then
+    pcall(function() genv.__CLOUDS_HUB_V3.Unload() end)
+end
 pcall(function()
-    if S._esp then
-        if S._esp.conns then for _, c in ipairs(S._esp.conns) do pcall(function() c:Disconnect() end) end end
-        if S._esp.objects then for _, o in pairs(S._esp.objects) do pcall(function() if o.hl then o.hl:Destroy() end end); pcall(function() if o.bb then o.bb:Destroy() end end) end end
-        if S._esp.folder then pcall(function() S._esp.folder:Destroy() end) end
-        if S._esp.gui then pcall(function() S._esp.gui:Destroy() end) end
-    end
+    local cg = (gethui and gethui()) or game:GetService("CoreGui")
+    local old = cg:FindFirstChild("CloudsHub_ToggleGui")
+    if old then old:Destroy() end
 end)
-pcall(function() if S._spectate and S._spectate.conns then for _, c in ipairs(S._spectate.conns) do pcall(function() c:Disconnect() end) end end end)
-pcall(function() if S._antiAfkConn then S._antiAfkConn:Disconnect() end end)
-pcall(function() if S._autoRun then S._autoRun.enabled = false end end)
-pcall(function() if S._steerInputRelease then S._steerInputRelease() end end)
+pcall(function()
+    local pg = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local old = pg and pg:FindFirstChild("CloudsHub_V3_LabuESP")
+    if old then old:Destroy() end
+end)
 
--- ===== services =====
-local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
-local UIS = game:GetService("UserInputService")
-local VIM = game:GetService("VirtualInputManager")
-local RunService = game:GetService("RunService")
+-- ===== 1. Services & state =================================================
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local PathfindingService = game:GetService("PathfindingService")
 local CollectionService = game:GetService("CollectionService")
-local GuiService = game:GetService("GuiService")
 
 local lp = Players.LocalPlayer
 
--- ===== state =====
-S._conns = S._conns or {}
--- running = Auto Fish AFK (cast + steer terpadu)
-S.running = S.running == true
-S.assistSteerOnly = S.assistSteerOnly == true -- manual cast, auto steer tetap jalan saat minigame
-S.autoEquip = (S.autoEquip ~= false)
-S.postDelay = math.clamp(tonumber(S.postDelay) or 2.0, 0.5, 10.0)
-S.retryDelay = math.clamp(tonumber(S.retryDelay) or 8.0, 2.0, 15.0)
-S.uiToggleKey = S.uiToggleKey or "F"
-S.autoSteer = (S.autoSteer ~= false)
+local S = {
+    version = "3.0.1",
+    -- fishing
+    running = false,
+    mode = "Full",            -- "Full" (auto cast + steer) | "Assist" (steer saja)
+    steerEnabled = true,
+    steerInput = "Mouse",     -- "Mouse" | "Space"
+    autoEquip = true,
+    castDelay = 9.0,          -- jeda antar cast / retry (detik)
+    postMinigameDelay = 1.8,  -- jeda setelah minigame selesai (detik)
+    biteTimeout = 45,         -- maks menunggu gigitan sebelum cast ulang
+    -- lain
+    antiAfk = false,
+    uiToggleKey = "F",
+    showPill = true,
+    -- internal
+    _conn = {},
+    _alive = true,
+    _wasBusy = false,
+    _sawMinigame = false,
+    _nextCastAt = 0,
+    _lastCastClick = 0,
+    _mgStart = nil,
+    _steerLast = 0,
+    _steerFails = 0,
+    _steerWarned = false,
+    _biteWaitUntil = 0,
+    _castConfirmed = false,
+}
+local Window = nil -- diisi saat UI jadi; dibaca Unload
 
-S._fish = S._fish or {}
-local F = S._fish
-F.phase = F.phase or "idle"
-F.nextAt = F.nextAt or 0
-F.lastCastAt = F.lastCastAt or 0
-F.pendingCastAt = F.pendingCastAt or 0
-F.lastCastMethod = "-"
-F.sawMinigame = false
-F.busySeen = false
-F.steerActive = false
-F.steerHolding = false
-F.lastSteerChange = 0
-
-S._esp = S._esp or { enabled = false, objects = {}, conns = {}, folder = nil, gui = nil }
-S._autoRun = S._autoRun or { enabled = false }
-S._spectate = S._spectate or { index = 0, target = nil, conns = {} }
-S._antiAfk = S._antiAfk or { enabled = false }
-
-local function now()
-    return os.clock()
+local function addConn(c)
+    if c then table.insert(S._conn, c) end
+    return c
 end
 
-local function safeDisconnect(x)
-    if not x then return end
+local function setStatus(t)
     pcall(function()
-        if x.Disconnect then
-            x:Disconnect()
-        end
+        if S._statusPara and S._statusPara.SetDesc then S._statusPara:SetDesc(t) end
     end)
 end
 
-local function getChar()
-    return lp.Character
-end
-
-local function getHum()
-    local c = getChar()
-    return c and c:FindFirstChildOfClass("Humanoid") or nil
-end
-
-local function getHRP()
-    local c = getChar()
-    return c and c:FindFirstChild("HumanoidRootPart") or nil
-end
-
-local function getPlayerGui()
-    return lp:FindFirstChild("PlayerGui")
-end
-
-local function isTextFocused()
-    local ok, r = pcall(function()
-        return UIS:GetFocusedTextBox() ~= nil
-    end)
-    return ok and r or false
-end
-
-local function diag(msg)
-    pcall(function()
-        print("[CloudsHub][diag] " .. tostring(msg))
-    end)
-end
-
--- ===== minigame helpers =====
-local function getFishingKitUI() local pg=getPlayerGui(); return pg and pg:FindFirstChild("FishingKitUI") or nil end
-
+-- ===== 2. Deteksi dasar ====================================================
 local function getHoldMinigame()
-    local ui = getFishingKitUI()
-    if not ui then return nil end
-    local hm = ui:FindFirstChild("HoldMinigame")
-    if hm then return hm end
-    for _, c in ipairs(ui:GetChildren()) do
-        local n = string.lower(c.Name)
-        if string.find(n, "hold") or string.find(n, "minigame") then return c end
-    end
-    return nil
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    local ui = pg and pg:FindFirstChild("FishingKitUI")
+    return ui and ui:FindFirstChild("HoldMinigame") or nil
 end
 
-local function findControllerByRole(root, role)
-    if not root then return nil end
-    local wantFish = (role == "fish")
-    local best = nil
-    for _, d in ipairs(root:GetDescendants()) do
-        if d:IsA("GuiObject") then
-            local ln = string.lower(d.Name)
-            local isFish = string.find(ln, "fish") ~= nil
-            local isPlayer = (string.find(ln, "player") ~= nil) or (string.find(ln, "bar") ~= nil) or (string.find(ln, "catch") ~= nil) or (string.find(ln, "pointer") ~= nil) or (string.find(ln, "handle") ~= nil)
-            local isCtrl = string.find(ln, "controller") ~= nil
-            if wantFish then
-                if isFish and (isCtrl or d.Name == "FishController" or d.Name == "Fish") then return d end
-                if not best and isFish then best = d end
-            else
-                if (isPlayer and isCtrl) or d.Name == "PlayerController" then return d end
-                if not best and isPlayer and not isFish then best = d end
-            end
-        end
-    end
-    return best
+local function isTextInputFocused()
+    local ok, focused = pcall(function() return UserInputService:GetFocusedTextBox() end)
+    return ok and focused ~= nil
 end
 
-local function getMinigameControllers(hm)
-    hm = hm or getHoldMinigame()
-    if not hm then return nil, nil, nil end
-    local frame = hm:FindFirstChild("Frame") or hm:FindFirstChildWhichIsA("Frame") or hm
-    local pc = frame:FindFirstChild("PlayerController")
-    local fc = frame:FindFirstChild("FishController")
-    if not pc then pc = findControllerByRole(frame, "player") end
-    if not fc then fc = findControllerByRole(frame, "fish") end
-    if (not pc or not fc) and frame ~= hm then
-        if not pc then pc = findControllerByRole(hm, "player") end
-        if not fc then fc = findControllerByRole(hm, "fish") end
-    end
-    return frame, pc, fc
+local function isBusy()
+    local ch = lp.Character
+    if not ch then return false end
+    local a, l
+    pcall(function() a = ch:GetAttribute("FishingBusy") end)
+    pcall(function() l = ch:GetAttribute("FishingLocked") end)
+    return a == true or l == true
 end
 
-local function isMinigameActive(hm)
-    hm = hm or getHoldMinigame()
-    if not hm then return false end
-    local ok, en = pcall(function() return hm.Enabled end)
+local function isRod(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    local ok, tagged = pcall(function()
+        return CollectionService:HasTag(tool, "FishingKitRod")
+    end)
+    if ok and tagged then return true end
+    local n = string.lower(tostring(tool.Name))
+    return string.find(n, "rod", 1, true) ~= nil
+end
+
+-- ===== 3. Modul input (VIM + fallback) =====================================
+local vimOK, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+if not vimOK then vim = nil end
+
+local function viewportPoint()
+    local cam = workspace.CurrentCamera
+    local ok, v = pcall(function() return cam and cam.ViewportSize or Vector2.new(960, 540) end)
+    return v.X * 0.5, v.Y * 0.55
+end
+
+local function vimSpace(down)
+    if not vim then error("no VIM") end
+    vim:SendKeyEvent(down, Enum.KeyCode.Space, false, game)
+end
+
+local function vimMouse(down, x, y)
+    if not vim then error("no VIM") end
+    local px, py = x or viewportPoint()
+    vim:SendMouseButtonEvent(px, py, 0, down, game, 0)
+end
+
+local function executorMouse(down)
+    if down then
+        if type(mouse1press) == "function" then mouse1press() else error("no mouse fallback") end
+    else
+        if type(mouse1release) == "function" then mouse1release() else error("no mouse fallback") end
+    end
+end
+
+-- Tahan/lepas input steer. Satu-satunya gerbang input untuk minigame.
+local function inputHold(down)
+    local st = S
+    local now = os.clock()
+    if st._inputHeld == down then return true end
+    if st._inputLastChange and (now - st._inputLastChange) < 0.08 then
+        return st._inputHeld or false -- anti-spam: minimal 80ms antar transisi
+    end
+    local ok = false
+    if S.steerInput == "Space" then
+        ok = pcall(vimSpace, down)
+        if not ok then ok = pcall(executorMouse, down) end
+    else
+        ok = pcall(vimMouse, down)
+        if not ok then ok = pcall(executorMouse, down) end
+    end
     if ok then
-        return en == true
+        st._inputHeld = down
+        st._inputLastChange = now
     end
-    -- fallback hanya jika Enabled tidak bisa dibaca
-    local _, pc, fc = getMinigameControllers(hm)
-    if pc and fc then
-        local frame = hm:FindFirstChild("Frame") or hm:FindFirstChildWhichIsA("Frame") or hm
-        local okV, vis = pcall(function() return frame.Visible end)
-        if okV and vis == true then return true end
+    return ok
+end
+
+local function inputRelease()
+    if S._inputHeld then
+        local ok = inputHold(false)
+        if not ok then S._inputHeld = false end
+    end
+end
+
+-- Klik cast: prioritaskan tombol Mobile game bila tampil (posisinya pasti
+-- benar), else klik area layar tengah. Selalu tekan-lepas singkat.
+local function castClick()
+    local now = os.clock()
+    if now - (S._lastCastClick or 0) < 2 then return false end
+    S._lastCastClick = now
+    local ok = pcall(function()
+        local targetX, targetY
+        local pg = lp:FindFirstChildOfClass("PlayerGui")
+        local ui = pg and pg:FindFirstChild("FishingKitUI")
+        local mob = ui and ui:FindFirstChild("Mobile")
+        local fb = mob and mob:FindFirstChild("FishButton")
+        if mob and mob.Visible and fb and fb.Visible then
+            local p, sz = fb.AbsolutePosition, fb.AbsoluteSize
+            targetX = p.X + sz.X * 0.5
+            targetY = p.Y + sz.Y * 0.5
+        else
+            targetX, targetY = viewportPoint()
+        end
+        vimMouse(true, targetX, targetY)
+        task.wait(0.04)
+        vimMouse(false, targetX, targetY)
+    end)
+    if ok and vim then return true end
+    if type(mouse1click) == "function" then
+        pcall(mouse1click)
+        return true
     end
     return false
 end
 
--- ===== rod & state =====
-local function getEquippedFishingRod()
-    local char = getChar(); if not char then return nil end
-    local ok, tagged = pcall(function() return CollectionService:GetTagged("FishingKitRod") end)
-    if ok and type(tagged) == "table" then
-        for _, t in ipairs(tagged) do if t and t:IsA("Tool") and t.Parent == char then return t end end
-    end
-    for _, t in ipairs(char:GetChildren()) do
-        if t:IsA("Tool") then local n = string.lower(t.Name); if string.find(n, "rod") or string.find(n, "pancing") then return t end end
-    end
-    return nil
-end
-
-local function equipFishingRod()
-    local char = getChar(); local hum = getHum(); local bp = lp:FindFirstChild("Backpack")
-    if not char or not hum or not bp then return false end
-    if getEquippedFishingRod() then return true end
-    local ok, tagged = pcall(function() return CollectionService:GetTagged("FishingKitRod") end)
-    if ok and type(tagged) == "table" then
-        for _, t in ipairs(tagged) do
-            if t and t:IsA("Tool") and t.Parent == bp then
-                local e = pcall(function() hum:EquipTool(t) end); if e then task.wait(0.05); return true end
-            end
-        end
-    end
+-- ===== 4. Rod equip ========================================================
+local function ensureRodEquipped()
+    local ch = lp.Character
+    local cur = ch and ch:FindFirstChildOfClass("Tool")
+    if isRod(cur) then return true end
+    local bp = lp:FindFirstChildOfClass("Backpack")
+    if not bp then return false end
+    local best
     for _, t in ipairs(bp:GetChildren()) do
-        if t:IsA("Tool") then
-            local n = string.lower(t.Name)
-            if string.find(n, "rod") or string.find(n, "pancing") then
-                local e = pcall(function() hum:EquipTool(t) end); if e then task.wait(0.05); return true end
+        if isRod(t) then
+            if string.find(string.lower(tostring(t.Name)), "areon", 1, true) then
+                best = t
+                break
             end
+            best = best or t
         end
+    end
+    if not best then return false end
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+    pcall(function() hum:EquipTool(best) end)
+    local deadline = os.clock() + 2
+    while os.clock() < deadline do
+        local c2 = lp.Character
+        local t2 = c2 and c2:FindFirstChildOfClass("Tool")
+        if isRod(t2) then return true end
+        task.wait(0.15)
     end
     return false
 end
 
-local function isFishingBusy()
-    local char = getChar(); if not char then return false end
-    local ok, v = pcall(function() return char:GetAttribute("FishingBusy") end)
-    return ok and v == true
-end
-local function isFishingLocked()
-    local char = getChar(); if not char then return false end
-    local ok, v = pcall(function() return char:GetAttribute("FishingLocked") end)
-    return ok and v == true
-end
-
--- ===== Auto Steer (input hold/release sesuai RodFunctions) =====
-local function setSteerHold(shouldHold)
-    shouldHold = shouldHold and true or false
-    if F.steerHolding == shouldHold then return end
-    local t = now()
-    if (t - (F.lastSteerChange or 0)) < 0.03 then return end
-    F.lastSteerChange = t
-    F.steerHolding = shouldHold
-    pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, shouldHold, game, 0) end)
-    pcall(function() VIM:SendKeyEvent(shouldHold, Enum.KeyCode.Space, false, game) end)
-end
-
-local function releaseSteerInput()
-    if F.steerHolding then
-        F.steerHolding = false
-        F.lastSteerChange = now()
+-- ===== 5. Auto-steer minigame (Heartbeat tunggal) ==========================
+-- Semantik minigame (hasil rekaman live):
+--   tahan  -> zona bergerak ke kanan
+--   lepas  -> zona auto-drift ke kiri
+--   ikan   = FishController (marker), zona = PlayerController (lebar 38% bar)
+--   progres mulai 0.40 -> 1.00 = sukses; minigame selesai = Enabled -> false
+local function readSteer(hm)
+    local bar = hm:FindFirstChild("Frame")
+    local zone = bar and bar:FindFirstChild("PlayerController")
+    local fish = bar and bar:FindFirstChild("FishController")
+    if not (bar and zone and fish) then return nil, "struktur GUI berubah" end
+    local bX, bW = bar.AbsolutePosition.X, bar.AbsoluteSize.X
+    if not bW or bW <= 0 then return nil, "bar size 0" end
+    local zX, zW = zone.AbsolutePosition.X, zone.AbsoluteSize.X
+    local fX, fW = fish.AbsolutePosition.X, fish.AbsoluteSize.X
+    local zL = (zX - bX) / bW
+    local zR = (zX + zW - bX) / bW
+    local fN = (fX + fW * 0.5 - bX) / bW
+    local center = (zL + zR) * 0.5
+    local db = math.max(0.05, (zR - zL) * 0.18) -- deadband ~ histeresis
+    if fN > center + db then
+        return true  -- ikan di kanan: tahan (zona ke kanan)
+    elseif fN < center - db then
+        return false -- ikan di kiri: lepas (zona ke kiri)
     end
-    pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
-    pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+    return nil -- di dalam deadband: pertahankan kondisi sekarang
 end
-S._steerInputRelease = releaseSteerInput
 
-local function steerTick()
-    F.steerActive = false
-    if not S.autoSteer or isTextFocused() then
-        releaseSteerInput(); return
+local steerHB = addConn(RunService.Heartbeat:Connect(function()
+    if not S._alive then return end
+    local now = os.clock()
+    if (now - S._steerLast) < 0.04 then return end
+    S._steerLast = now
+
+    local hm = getHoldMinigame()
+    local active = hm and hm.Enabled
+    if not active then
+        inputRelease()
+        S._mgStart = nil
+        S._steerFails = 0
+        S._steerWarned = false
+        return
+    end
+
+    if isTextInputFocused() then
+        inputRelease()
+        return
+    end
+
+    if not S._mgStart then S._mgStart = now end
+    if (now - S._mgStart) > 90 then
+        -- failsafe: minigame nyangkut terlalu lama -> lepas, jangan kunci input
+        inputRelease()
+        return
+    end
+
+    if not S.steerEnabled then
+        inputRelease()
+        return
+    end
+
+    local okR, want, err = pcall(function()
+        local w, e = readSteer(hm)
+        return w, e
+    end)
+    if not okR then
+        S._steerFails = S._steerFails + 1
+        if S._steerFails >= 30 and not S._steerWarned then
+            S._steerWarned = true
+            S.steerEnabled = false
+            inputRelease()
+            warn("[CloudsHub] auto-steer dimatikan (error GUI berulang)")
+        end
+        return
+    end
+    if want == nil then return end -- deadband: pertahankan
+    S._steerFails = 0
+    inputHold(want)
+end))
+
+-- ===== 6. Loop utama mancing (state machine, tanpa hook) ===================
+local function fishingStep()
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not (ch and hum and ch:FindFirstChild("HumanoidRootPart")) then
+        setStatus("Menunggu karakter...")
+        return 1
     end
 
     local hm = getHoldMinigame()
-    local _, pc, fc = getMinigameControllers(hm)
-    local active = isMinigameActive(hm)
-    if not active and pc and fc then
-        local okV1, v1 = pcall(function() return pc.Visible end)
-        local okV2, v2 = pcall(function() return fc.Visible end)
-        if (okV1 and v1) and (okV2 and v2) then active = true end
-    end
-    if not active or not (pc and fc and pc:IsA("GuiObject") and fc:IsA("GuiObject")) then
-        releaseSteerInput(); return
+    if hm and hm.Enabled then
+        -- steering ditangani Heartbeat; loop cuma menunggu & menampilkan status
+        if not S._wasBusy then S._wasBusy = true end
+        S._sawMinigame = true
+        setStatus(S.steerEnabled and "Minigame: auto-steer aktif" or "Minigame berjalan (steer OFF)")
+        return 0.1
     end
 
-    F.steerActive = true
-    local ok = pcall(function()
-        local fishX = fc.Position.X.Scale
-        local barX = pc.Position.X.Scale
-        local diff = fishX - barX
-        local dead = 0.012
-        if diff > dead then
-            setSteerHold(true)
-        elseif diff < -dead then
-            setSteerHold(false)
-        else
-            if diff >= 0 then setSteerHold(true) else setSteerHold(false) end
+    if isTextInputFocused() then
+        inputRelease()
+        setStatus("Pause (chat/fokus teks)")
+        return 0.25
+    end
+
+    if isBusy() then
+        S._wasBusy = true
+        setStatus(S._sawMinigame and "Proses tangkapan..." or "Menunggu ikan menyentuh senar...")
+        return 0.2
+    end
+
+    if S._wasBusy then
+        -- baru saja selesai fase cast/bite/minigame
+        S._wasBusy = false
+        if S._sawMinigame then
+            -- minigame pernah jalan -> siklus benar-benar selesai
+            S._castConfirmed = false
+            if S.mode == "Full" then
+                local d = tonumber(S.postMinigameDelay) or 1.8
+                S._sawMinigame = false
+                S._nextCastAt = math.max(S._nextCastAt or 0, os.clock() + d)
+                setStatus(string.format("Siklus selesai, tunggu %.1fs", math.max(0, S._nextCastAt - os.clock())))
+            else
+                S._sawMinigame = false
+                setStatus("Assist: idle (cast manual)")
+            end
+            return 0.15
+        end
+        -- busy hilang TANPA minigame: senar kemungkinan masih keluar
+        -- (busy=false saat tunggu bite) -> biarkan fase bite di bawah yang mengatur
+    end
+
+    if S.mode ~= "Full" then
+        setStatus("Assist: tunggu minigame (cast manual)")
+        return 0.3
+    end
+
+    -- fase menunggu gigitan: JANGAN cast ulang walau busy=false (anti double-cast)
+    if S._castConfirmed then
+        if os.clock() < (S._biteWaitUntil or 0) then
+            setStatus("Menunggu ikan menyentuh senar...")
+            return 0.2
+        end
+        S._castConfirmed = false
+        S._nextCastAt = os.clock() + (tonumber(S.castDelay) or 9.0)
+        setStatus("Tidak ada gigitan, cast ulang nanti")
+        return 0.3
+    end
+
+    local remain = (S._nextCastAt or 0) - os.clock()
+    if remain > 0 then
+        setStatus(string.format("Tunggu %.1fs", remain))
+        return 0.2
+    end
+
+    if S.autoEquip and not ensureRodEquipped() then
+        setStatus("Rod tidak ditemukan (taruh rod di backpack)")
+        S._nextCastAt = os.clock() + 2
+        return 1
+    end
+
+    setStatus("Cast...")
+    if not castClick() then
+        S._nextCastAt = os.clock() + 1.5
+        return 0.6
+    end
+
+    -- verifikasi cast: harus muncul busy/minigame dalam 3s
+    local deadline = os.clock() + 3
+    while os.clock() < deadline and S.running and S._alive do
+        task.wait(0.2)
+        local hm2 = getHoldMinigame()
+        if (hm2 and hm2.Enabled) or isBusy() then
+            S._wasBusy = true
+            S._castConfirmed = true
+            S._biteWaitUntil = os.clock() + (tonumber(S.biteTimeout) or 45)
+            S._nextCastAt = os.clock() + (tonumber(S.castDelay) or 9.0)
+            setStatus("Cast OK — menunggu ikan...")
+            return 0.2
+        end
+    end
+    S._nextCastAt = os.clock() + (tonumber(S.castDelay) or 9.0)
+    setStatus("Cast tidak terkonfirmasi, retry nanti")
+    return 0.4
+end
+
+task.spawn(function()
+    while S._alive do
+        local waitT = 0.3
+        if S.running then
+            local ok, ret = pcall(fishingStep)
+            if not ok then
+                warn("[CloudsHub] loop error:", ret)
+                waitT = 1
+            else
+                waitT = tonumber(ret) or 0.3
+            end
+        end
+        task.wait(waitT)
+    end
+end)
+
+-- ===== 7. Anti-AFK =========================================================
+local afkConn = nil
+local function setAntiAfk(on)
+    S.antiAfk = on and true or false
+    if afkConn then pcall(function() afkConn:Disconnect() end) afkConn = nil end
+    if not on then return end
+    afkConn = addConn(lp.Idled:Connect(function()
+        if not S.antiAfk then return end
+        pcall(function()
+            local vu = game:GetService("VirtualUser")
+            vu:CaptureController()
+            vu:ClickButton2(Vector2.new())
+        end)
+    end))
+end
+
+-- ===== 8. Pumpkin ESP (Workspace.LabuAktif) ================================
+local esp = { on = false, conns = {}, thread = nil }
+
+local function labuContainer()
+    local ws = workspace
+    return ws:FindFirstChild("LabuAktif") or ws:WaitForChild("LabuAktif", 5)
+end
+
+local function clearEsp(inst)
+    if not inst then return end
+    pcall(function()
+        local h = inst:FindFirstChild("CloudsHub_Highlight"); if h then h:Destroy() end
+        local b = inst:FindFirstChild("CloudsHub_Billboard"); if b then b:Destroy() end
+    end)
+end
+
+local function decorateLabu(part)
+    if not part or not part:IsA("BasePart") then return end
+    clearEsp(part)
+    pcall(function()
+        local h = Instance.new("Highlight")
+        h.Name = "CloudsHub_Highlight"
+        h.FillColor = Color3.fromHex("#38bdf8")
+        h.OutlineColor = Color3.fromHex("#f0f9ff")
+        h.FillTransparency = 0.6
+        h.OutlineTransparency = 0
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.Adornee = part
+        h.Parent = part
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "CloudsHub_Billboard"
+        bb.Adornee = part
+        bb.Size = UDim2.new(0, 150, 0, 34)
+        bb.StudsOffset = Vector3.new(0, 3.5, 0)
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = 600
+        bb.Parent = part
+
+        local tl = Instance.new("TextLabel")
+        tl.Name = "Label"
+        tl.Size = UDim2.new(1, 0, 1, 0)
+        tl.BackgroundTransparency = 1
+        tl.Font = Enum.Font.GothamBold
+        tl.TextSize = 14
+        tl.TextColor3 = Color3.fromHex("#f0f9ff")
+        tl.TextStrokeTransparency = 0.35
+        tl.Text = "🎃 Labu"
+        tl.Parent = bb
+    end)
+end
+
+local function espUpdateLabels()
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local c = labuContainer()
+    if not (c and hrp) then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then
+            local bb = p:FindFirstChild("CloudsHub_Billboard")
+            local tl = bb and bb:FindFirstChild("Label")
+            if tl then
+                local d = (p.Position - hrp.Position).Magnitude
+                tl.Text = string.format("🎃 Labu (%.0fm)", d)
+            end
+        end
+    end
+end
+
+local function setPumpkinESP(on)
+    esp.on = on and true or false
+    for _, c in ipairs(esp.conns) do pcall(function() c:Disconnect() end) end
+    esp.conns = {}
+    if esp.thread then
+        esp._stop = true
+        esp.thread = nil
+    end
+    local c = labuContainer()
+    if not c then
+        warn("[CloudsHub] Workspace.LabuAktif tidak ditemukan")
+        return
+    end
+    if not on then
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then clearEsp(p) end
+        end
+        return
+    end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") and string.find(p.Name, "Labu", 1, true) then
+            decorateLabu(p)
+        end
+    end
+    table.insert(esp.conns, addConn(c.ChildAdded:Connect(function(ch2)
+        task.wait(0.2)
+        if esp.on and ch2:IsA("BasePart") then decorateLabu(ch2) end
+    end)))
+    table.insert(esp.conns, addConn(c.ChildRemoved:Connect(function(ch2)
+        clearEsp(ch2)
+    end)))
+    task.spawn(function()
+        while esp.on and S._alive do
+            pcall(espUpdateLabels)
+            task.wait(0.5)
         end
     end)
-    if not ok then releaseSteerInput() end
 end
 
--- ===== Auto Cast (cross-platform, sesuai alur controller/game) =====
-local function clickGuiButton(btn)
-    if not (btn and btn:IsA("GuiButton")) then return false end
-    local did = false
-    if type(firesignal) == "function" then
-        did = pcall(function() if btn.Activated then firesignal(btn.Activated) end end) or did
-        if not did then did = pcall(function() if btn.MouseButton1Click then firesignal(btn.MouseButton1Click) end end) or did end
-        if not did then did = pcall(function() if btn.MouseButton1Down then firesignal(btn.MouseButton1Down) end end) or did end
-        if not did then did = pcall(function() if btn.MouseButton1Up then firesignal(btn.MouseButton1Up) end end) or did end
-    end
-    if not did then
-        local okP, absPos, absSize = pcall(function() return btn.AbsolutePosition, btn.AbsoluteSize end)
-        if okP and absPos and absSize then
-            local insetY = 36
-            pcall(function() insetY = GuiService:GetGuiInset().Y end)
-            local x = absPos.X + absSize.X * 0.5
-            local y = absPos.Y + absSize.Y * 0.5 + insetY
-            did = pcall(function()
-                VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-                task.wait(0.03)
-                VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-            end) or did
+-- ===== 9. Auto Run ke Labu (pathfinding + anti-stuck) ======================
+local autoRun = { on = false, thread = nil, walkSpeed = nil }
+
+local function nearestLabu()
+    local c = workspace:FindFirstChild("LabuAktif")
+    if not c then return nil end
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local best, bestD
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") and string.find(p.Name, "Labu", 1, true) then
+            local d = (p.Position - hrp.Position).Magnitude
+            if not bestD or d < bestD then best, bestD = p, d end
         end
     end
-    return did
-end
-
-local function tryCast()
-    if isTextFocused() then return false, "focused" end
-    local hum = getHum()
-    if not hum or hum.Health <= 0 then return false, "nochar" end
-    if isMinigameActive() or isFishingBusy() or isFishingLocked() then return false, "busy" end
-
-    if S.autoEquip then
-        if not getEquippedFishingRod() then
-            pcall(equipFishingRod)
-            task.wait(0.2)
-        end
-    end
-    local rod = getEquippedFishingRod()
-    if not rod then
-        F.lastCastMethod = "no-rod"
-        return false, "no-rod"
-    end
-
-    local okAny = false
-    local method = "fail"
-
-    local methods = {}
-
-    -- Pastikan tool aktif/konteks siap (tanpa memanggil RodFunctions.Cast secara langsung agar tidak konflik)
-    pcall(function() if rod.Activate then rod:Activate() end end)
-    task.wait(0.05)
-
-    local ui = getFishingKitUI()
-    local mobileBtn = ui and ui:FindFirstChild("Mobile")
-
-    -- 1) Klik tombol Mobile (ImageButton) - terbukti memicu alur cast saat cycle berjalan
-    if mobileBtn and mobileBtn:IsA("GuiButton") then
-        if clickGuiButton(mobileBtn) then table.insert(methods, "mobile-btn") end
-    end
-
-    -- 2) Input klik/tap area world (PC/iOS/Android) - satu usaha per siklus, hindari spam
-    local cam = workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize or Vector2.new(1000, 700)
-    local x, y = vp.X * 0.5, vp.Y * 0.45
-    if UIS.TouchEnabled then
-        if type(VIM.SendTouchEvent) == "function" then
-            local okTap = pcall(function()
-                VIM:SendTouchEvent(0, 1, 0, x, y)
-                task.wait(0.03)
-                VIM:SendTouchEvent(0, 2, 0, x, y)
-            end)
-            if okTap then table.insert(methods, "touch") end
-        end
-    else
-        local okClick = pcall(function()
-            VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-            task.wait(0.04)
-            VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-        end)
-        if okClick then table.insert(methods, "vim-click") end
-    end
-
-    -- 3) Fallback mouse1click bila diperlukan
-    if #methods == 0 and type(mouse1click) == "function" then
-        local okM = pcall(function() mouse1click() end)
-        if okM then table.insert(methods, "mouse1click") end
-    end
-
-    if #methods > 0 then
-        local method = table.concat(methods, "+")
-        F.lastCastMethod = method
-        return true, method
-    end
-
-    F.lastCastMethod = "fail"
-    return false, "fail"
-end
-
--- ===== Fishing tick (AFK: cast + steer terpadu) =====
-local function fishingTick()
-    local t = now()
-    local inMinigame = isMinigameActive()
-    local busy = isFishingBusy() or isFishingLocked()
-
-    if inMinigame then
-        F.phase = "minigame"; F.sawMinigame = true; F.busySeen = true; F.pendingCastAt = 0
-        return
-    end
-    if F.sawMinigame or F.busySeen then
-        if not inMinigame and not busy then
-            F.sawMinigame = false; F.busySeen = false
-            F.phase = "cooldown"
-            F.nextAt = math.max(F.nextAt, t + S.postDelay)
-            F.pendingCastAt = 0
-            diag("cycle complete, cooldown " .. tostring(S.postDelay) .. "s")
-            return
-        end
-    end
-    if busy then
-        F.phase = "waiting"; F.busySeen = true; F.pendingCastAt = 0
-        return
-    end
-
-    -- Auto-cast hanya jika mode AFK penuh aktif
-    if not S.running then
-        F.phase = "idle"; F.pendingCastAt = 0; return
-    end
-    if isTextFocused() then return end
-    local hum = getHum()
-    if not hum or hum.Health <= 0 then return end
-
-    if F.pendingCastAt > 0 then
-        if (t - F.pendingCastAt) < S.retryDelay then
-            F.phase = "waiting"; return
-        else
-            diag("cast timeout, retry"); F.pendingCastAt = 0
-        end
-    end
-    if t < F.nextAt then F.phase = "cooldown"; return end
-    if (t - F.lastCastAt) < 1.2 then return end
-
-    F.phase = "casting"
-    local ok, method = tryCast()
-    F.lastCastAt = t
-    if ok then
-        diag("cast ok: " .. tostring(method))
-        F.pendingCastAt = t
-        F.phase = "waiting"
-    else
-        diag("cast fail: " .. tostring(method))
-        F.pendingCastAt = 0
-        F.phase = "idle"
-        F.nextAt = t + 2.0
-    end
-end
-
--- ===== ESP, AutoRun, Spectate, Anti-AFK =====
-local function getLabuFolder() return workspace:FindFirstChild("LabuAktif") end
-local function ensureEspGui()
-    local pg = getPlayerGui(); if not pg then return nil end
-    local gui = pg:FindFirstChild("CloudsHub_LabuESP")
-    if not gui then
-        gui = Instance.new("ScreenGui"); gui.Name = "CloudsHub_LabuESP"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true; gui.DisplayOrder = 5; gui.Parent = pg
-    end
-    return gui
-end
-local function clearEspObjects()
-    if not S._esp or not S._esp.objects then return end
-    for k, o in pairs(S._esp.objects) do
-        pcall(function() if o.hl then o.hl:Destroy() end end)
-        pcall(function() if o.bb then o.bb:Destroy() end end)
-        S._esp.objects[k] = nil
-    end
-end
-local function addEspFor(part)
-    if not (part and part:IsA("BasePart") and part.Parent) then return end
-    if S._esp.objects[part] then return end
-    local hl = Instance.new("Highlight")
-    hl.Name = "CH_LabuHL"; hl.Adornee = part; hl.FillTransparency = 0.6; hl.OutlineTransparency = 0; hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent = S._esp.folder or workspace
-    local bb = Instance.new("BillboardGui")
-    bb.Name = "CH_LabuBB"; bb.Adornee = part; bb.Size = UDim2.new(0, 120, 0, 36); bb.StudsOffset = Vector3.new(0, 3, 0); bb.AlwaysOnTop = true
-    bb.Parent = ensureEspGui()
-    local tl = Instance.new("TextLabel")
-    tl.BackgroundTransparency = 1; tl.Size = UDim2.new(1, 0, 1, 0); tl.TextScaled = true; tl.Font = Enum.Font.GothamBold; tl.TextStrokeTransparency = 0.2
-    tl.Text = "🎃 " .. tostring(part.Name); tl.TextColor3 = Color3.fromRGB(255, 170, 60); tl.Parent = bb
-    S._esp.objects[part] = { hl = hl, bb = bb }
-end
-local function refreshEsp()
-    if not S._esp.enabled then return end
-    local folder = getLabuFolder()
-    for part, obj in pairs(S._esp.objects) do
-        if not (part and part.Parent and folder and part:IsDescendantOf(folder) and string.find(part.Name, "Labu_")) then
-            pcall(function() if obj.hl then obj.hl:Destroy() end end)
-            pcall(function() if obj.bb then obj.bb:Destroy() end end)
-            S._esp.objects[part] = nil
-        end
-    end
-    if not folder then return end
-    for _, ch in ipairs(folder:GetChildren()) do if ch:IsA("BasePart") and string.find(ch.Name, "Labu_") then addEspFor(ch) end end
-end
-local function setPumpkinEsp(on)
-    S._esp.enabled = on and true or false
-    if S._esp.conns then for _, c in ipairs(S._esp.conns) do safeDisconnect(c) end; S._esp.conns = {} end
-    if not on then clearEspObjects(); return end
-    if not S._esp.folder or not S._esp.folder.Parent then local f = Instance.new("Folder"); f.Name = "CloudsHub_LabuESP_HL"; f.Parent = workspace; S._esp.folder = f end
-    ensureEspGui(); refreshEsp()
-    local folder = getLabuFolder()
-    if folder then
-        table.insert(S._esp.conns, folder.ChildAdded:Connect(function(ch) task.wait(0.05); if S._esp.enabled and ch:IsA("BasePart") and string.find(ch.Name, "Labu_") then addEspFor(ch) end end))
-        table.insert(S._esp.conns, folder.ChildRemoved:Connect(function() task.defer(refreshEsp) end))
-    end
-    task.spawn(function() while S._esp.enabled do pcall(refreshEsp); task.wait(2.0) end end)
-end
-
--- AutoRun
-local function releaseRunKeys() if UIS.KeyboardEnabled and not UIS.TouchEnabled then pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game) end) end end
-local function ensureRun(hum)
-    if not hum then return end
-    pcall(function() if hum.WalkSpeed < 20 then hum.WalkSpeed = 20 end end)
-    if UIS.KeyboardEnabled and not UIS.TouchEnabled then pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game) end) end
-end
-local function getActivePumpkins()
-    local folder = getLabuFolder(); local out = {}
-    if not folder then return out end
-    for _, ch in ipairs(folder:GetChildren()) do if ch:IsA("BasePart") and string.find(ch.Name, "Labu_") then table.insert(out, ch) end end
-    return out
-end
-local function getNearestPumpkin()
-    local hrp = getHRP(); if not hrp then return nil, math.huge end
-    local best, bestD = nil, math.huge
-    for _, p in ipairs(getActivePumpkins()) do if p and p.Parent then local d = (p.Position - hrp.Position).Magnitude; if d < bestD then best, bestD = p, d end end end
     return best, bestD
 end
-local function moveToWithTimeout(hum, pos, timeoutSec)
-    local done, reached = false, false; timeoutSec = timeoutSec or 2.5
-    local conn = hum.MoveToFinished:Connect(function(r) reached = r; done = true end)
-    hum:MoveTo(pos); local t0 = now()
-    while not done and (now() - t0) < timeoutSec do if not S._autoRun.enabled then break end; task.wait(0.1) end
-    if conn then pcall(function() conn:Disconnect() end) end
-    return reached, done
+
+local function moveToHuman(hum, pos, timeout)
+    local done = false
+    local conn = hum.MoveToFinished:Connect(function() done = true end)
+    hum:MoveTo(pos)
+    local t0 = os.clock()
+    while not done and (os.clock() - t0) < (timeout or 2.5) do
+        task.wait(0.05)
+        if not autoRun.on then break end
+    end
+    pcall(function() conn:Disconnect() end)
+    return done
 end
-local function computeWaypoints(fromPos, toPos)
-    local path = PathfindingService:CreatePath({ AgentRadius = 3, AgentHeight = 6, AgentCanJump = true, WaypointSpacing = 5 })
-    local ok = pcall(function() path:ComputeAsync(fromPos, toPos) end)
-    if ok and path.Status == Enum.PathStatus.Success then local wps = path:GetWaypoints(); if #wps > 0 then return wps end end
-    return { { Position = toPos, Action = Enum.PathWaypointAction.Walk } }
-end
-local function runToTarget(targetPart)
-    local hum = getHum(); local hrp = getHRP()
-    if not hum or not hrp or not targetPart or not targetPart.Parent then return false end
-    ensureRun(hum)
-    local wps = computeWaypoints(hrp.Position, targetPart.Position)
-    local startIdx = (#wps > 1) and 2 or 1
-    for i = startIdx, #wps do
-        if not S._autoRun.enabled or not targetPart.Parent then return false end
-        hum = getHum(); hrp = getHRP(); if not hum or not hrp then return false end
-        ensureRun(hum)
-        local wp = wps[i]
-        if wp.Action == Enum.PathWaypointAction.Jump then pcall(function() hum.Jump = true end); task.wait(0.05) end
-        local before = hrp.Position
-        moveToWithTimeout(hum, wp.Position, 3.0); task.wait(0.05)
-        hrp = getHRP(); if not hrp then return false end
-        if (hrp.Position - targetPart.Position).Magnitude <= 4.5 then return true end
-        if (hrp.Position - before).Magnitude < 0.8 then
-            pcall(function() hum.Jump = true end); task.wait(0.15)
-            local hrp2 = getHRP()
-            if hrp2 and (hrp2.Position - before).Magnitude < 0.8 then
-                pcall(function() hum:MoveTo(wp.Position + Vector3.new(math.random(-2,2)*0.2, 0, math.random(-2,2)*0.2)) end); task.wait(0.2)
-            end
-            return false
+
+local function autoRunLoop()
+    while autoRun.on and S._alive do
+        local ch = lp.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not (hum and hrp) then task.wait(1) continue end
+        local target = nearestLabu()
+        if not target then
+            task.wait(5)
+            continue
         end
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentCanClimb = false,
+            WaypointSpacing = 4,
+        })
+        local okPath, errPath = pcall(function()
+            path:ComputeAsync(target.Position + Vector3.new(0, 3, 0))
+        end)
+        if not okPath or path.Status ~= Enum.PathStatus.Success then
+            -- fallback: lari langsung
+            if not moveToHuman(hum, target.Position + Vector3.new(0, 3, 0), 4) then task.wait(1) end
+            continue
+        end
+        local wps = path:GetWaypoints()
+        for i, wp in ipairs(wps) do
+            if not autoRun.on or not S._alive then break end
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                pcall(function() hum.Jump = true end)
+            end
+            local ok = moveToHuman(hum, wp.Position, 2.5)
+            if not ok then
+                pcall(function() hum.Jump = true end)
+                if not moveToHuman(hum, wp.Position, 2) then break end -- repath
+            end
+        end
+        if autoRun.on then task.wait(1.5) end -- jeda di labu sebelum cari lagi
+    end
+end
+
+local function startAutoRun()
+    if autoRun.on then return end
+    autoRun.on = true
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            autoRun.walkSpeed = hum.WalkSpeed
+            hum.WalkSpeed = 22 -- best-effort
+        end)
+    end
+    autoRun.thread = task.spawn(autoRunLoop)
+end
+
+local function stopAutoRun()
+    autoRun.on = false
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if hum then
+        pcall(function()
+            if autoRun.walkSpeed then hum.WalkSpeed = autoRun.walkSpeed end
+        end)
+    end
+    if hrp then pcall(function() hum:MoveTo(hrp.Position) end) end
+end
+
+-- ===== 10. Spectate ========================================================
+local spectate = { target = nil, index = 0 }
+
+local function othersList()
+    local t = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then table.insert(t, p) end
+    end
+    return t
+end
+
+local function bindCameraTo(player)
+    local ch = player and player.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local cam = workspace.CurrentCamera
+    if cam and hum then
+        pcall(function() cam.CameraSubject = hum end)
+        return true
     end
     return false
 end
-local function stopAutoRun()
-    S._autoRun.enabled = false; releaseRunKeys()
-    local hum = getHum(); local hrp = getHRP()
-    if hum and hrp then pcall(function() hum:MoveTo(hrp.Position) end) end
-end
-local function startAutoRun()
-    stopAutoRun(); S._autoRun.enabled = true
-    S._autorunThread = task.spawn(function()
-        while S._autoRun.enabled do
-            local okLoop = pcall(function()
-                local hum = getHum(); local hrp = getHRP()
-                if not hum or not hrp then task.wait(0.4); return end
-                ensureRun(hum)
-                local target, dist = getNearestPumpkin()
-                if not target then task.wait(0.6); return end
-                if dist <= 4.5 then task.wait(0.25); return end
-                runToTarget(target); task.wait(0.12)
+
+local function setSpectate(player)
+    if spectate.charConn then
+        pcall(function() spectate.charConn:Disconnect() end)
+        spectate.charConn = nil
+    end
+    spectate.target = player
+    if not player then
+        bindCameraTo(lp)
+        spectate.index = 0
+        return true
+    end
+    if not bindCameraTo(player) then
+        task.spawn(function()
+            local ok, conn = pcall(function()
+                return player.CharacterAdded:Wait()
             end)
-            if not okLoop then task.wait(0.4) end
-            task.wait(0.08)
-        end
-        releaseRunKeys()
-    end)
-end
-
--- Spectate
-local function getPlayerList()
-    local list = {}
-    for _, p in ipairs(Players:GetPlayers()) do if p ~= lp then table.insert(list, p) end end
-    table.sort(list, function(a,b) return a.Name:lower() < b.Name:lower() end)
-    return list
-end
-local function applySpectateCamera(target)
-    local cam = workspace.CurrentCamera; if not cam then return end
-    if target then local hum = target.Character and target.Character:FindFirstChildOfClass("Humanoid"); if hum then cam.CameraSubject = hum end
-    else local myHum = getHum(); if myHum then cam.CameraSubject = myHum end end
-end
-local function setSpectateTarget(p)
-    S._spectate.target = p; S._spectate.index = 0
-    if p then local list = getPlayerList(); for i,v in ipairs(list) do if v == p then S._spectate.index = i break end end end
-    applySpectateCamera(p)
-end
-local function spectateStep(delta)
-    local list = getPlayerList(); if #list == 0 then setSpectateTarget(nil); return nil end
-    local idx = (S._spectate.index or 0) + delta
-    if idx < 1 then idx = #list elseif idx > #list then idx = 1 end
-    S._spectate.index = idx; local target = list[idx]; S._spectate.target = target; applySpectateCamera(target); return target
-end
-table.insert(S._spectate.conns, Players.PlayerRemoving:Connect(function(p) if S._spectate.target == p then setSpectateTarget(nil) end end))
-table.insert(S._spectate.conns, RunService.RenderStepped:Connect(function() if S._spectate.target then pcall(applySpectateCamera, S._spectate.target) end end))
-for _, c in ipairs(S._spectate.conns) do table.insert(S._conns, c) end
-
--- Anti-AFK
-local function setAntiAfk(on)
-    S._antiAfk.enabled = on and true or false
-    if S._antiAfkConn then safeDisconnect(S._antiAfkConn); S._antiAfkConn = nil end
-    if not on then return end
-    local vu = game:GetService("VirtualUser")
-    S._antiAfkConn = lp.Idled:Connect(function()
-        pcall(function()
-            vu:Button2Down(Vector2.new(0,0), workspace.CurrentCamera and workspace.CurrentCamera.CFrame or CFrame.new())
-            task.wait(0.05)
-            vu:Button2Up(Vector2.new(0,0), workspace.CurrentCamera and workspace.CurrentCamera.CFrame or CFrame.new())
+            if ok and spectate.target == player then
+                task.wait(0.5)
+                pcall(function() bindCameraTo(player) end)
+            end
         end)
-    end)
-    table.insert(S._conns, S._antiAfkConn)
+    end
+    spectate.charConn = addConn(player.CharacterAdded:Connect(function()
+        if spectate.target ~= player then return end
+        task.wait(0.5)
+        pcall(function() bindCameraTo(player) end)
+    end))
+    return true
 end
 
--- ===== UI =====
-local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
-pcall(function() WindUI:AddTheme({ Name = "Clouds", Accent = Color3.fromHex("#6aa9ff"), Dialog = Color3.fromHex("#dbeafe"), Outline = Color3.fromHex("#93c5fd"), Text = Color3.fromHex("#eaf4ff"), Placeholder = Color3.fromHex("#9cc7ff"), Background = Color3.fromHex("#0f233d"), Button = Color3.fromHex("#3b82f6"), Icon = Color3.fromHex("#bfdbfe") }) end)
-pcall(function() WindUI:SetTheme("Clouds") end)
-pcall(function() WindUI.TransparencyValue = 0.08 end)
-
-local Window = WindUI:CreateWindow({
-    Title = "Clouds Hub V2.3.4",
-    Icon = "cloud",
-    Author = "Clouds Hub",
-    Folder = "CloudsHub",
-    Size = UDim2.fromOffset(430, 380),
-    Transparent = true,
-    Theme = "Clouds",
-    SideBarWidth = 170,
-    HasOutline = true,
-    User = { Enabled = true, Anonymous = false, Callback = function() end },
-})
-S._ui = Window
-
-local function applyToggleKey(win, keyStr)
-    local name = tostring(keyStr or "F"):upper(); S.uiToggleKey = name
-    local keyCode = Enum.KeyCode[name] or Enum.KeyCode.F
-    pcall(function() if win and win.SetToggleKey then win:SetToggleKey(keyCode) end end)
-    return keyCode
+local function spectateStep(dir)
+    local list = othersList()
+    if #list == 0 then return nil end
+    spectate.index = ((spectate.index + dir - 1) % #list) + 1
+    local p = list[spectate.index]
+    setSpectate(p)
+    return p
 end
-pcall(function() Window:Tag({ Title = "v2.3.4 AFK", Icon = "cloud" }) end)
+
+table.insert(S._conn, Players.PlayerRemoving:Connect(function(p)
+    if spectate.target == p then
+        setSpectate(nil)
+        pcall(function()
+            if S._specStatus then S._specStatus:SetDesc("Target: - (player keluar)") end
+        end)
+    end
+end))
+
+-- ===== 11. UI (WindUI, tema biru langit) ===================================
+local WindUIOK, WindUI = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+end)
+if not WindUIOK or type(WindUI) ~= "table" then
+    warn("[CloudsHub] Gagal memuat WindUI:", tostring(WindUI))
+    S._alive = false
+    return
+end
+
 pcall(function()
-    local cg = game:GetService("CoreGui")
-    local gui = Instance.new("ScreenGui"); gui.Name = "CloudsHub_ToggleGui"; gui.ResetOnSpawn = false; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = cg
-    local btn = Instance.new("TextButton"); btn.Name = "ToggleCloudsHub"; btn.Size = UDim2.fromOffset(118, 36); btn.Position = UDim2.new(0, 14, 0.5, -18)
-    btn.BackgroundColor3 = Color3.fromRGB(59, 130, 246); btn.BackgroundTransparency = 0.12; btn.Text = "☁ Clouds Hub"; btn.TextColor3 = Color3.fromRGB(255,255,255)
-    btn.Font = Enum.Font.GothamBold; btn.TextSize = 13; btn.Active = true; btn.Draggable = true; btn.Parent = gui
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
-    local st = Instance.new("UIStroke", btn); st.Thickness = 1.2; st.Color = Color3.fromRGB(191,219,254); st.Transparency = 0.25
-    btn.MouseButton1Click:Connect(function() pcall(function() if Window and Window.Toggle then Window:Toggle() end end) end)
+    WindUI:AddTheme({
+        Name = "CloudsSky",
+        Accent = Color3.fromHex("#38bdf8"),
+        Dialog = Color3.fromHex("#bae6fd"),
+        Outline = Color3.fromHex("#7dd3fc"),
+        Text = Color3.fromHex("#f0f9ff"),
+        Placeholder = Color3.fromHex("#7ba7cc"),
+        Background = Color3.fromHex("#0b1526"),
+        Button = Color3.fromHex("#0ea5e9"),
+        Icon = Color3.fromHex("#bae6fd"),
+    })
+    WindUI:SetTheme("CloudsSky")
+    WindUI.TransparencyValue = 0.06
 end)
 
-local TabMemancing = Window:Tab({ Title = "Memancing", Icon = "fish" })
-local TabHalloween = Window:Tab({ Title = "Halloween", Icon = "ghost" })
-local TabPlayer = Window:Tab({ Title = "Player", Icon = "users" })
+Window = WindUI:CreateWindow({
+    Title = "Clouds Hub V3.0.1",
+    SubTitle = "Solova Hangout",
+    Icon = "cloud",
+    Author = "Clouds Hub",
+    Folder = "CloudsHubV3",
+    Size = UDim2.fromOffset(440, 390),
+    Transparent = true,
+    Theme = "CloudsSky",
+    SideBarWidth = 170,
+    HasOutline = true,
+    Resizable = true,
+    HideSearchBar = true,
+    AutoScale = true,
+    User = { Enabled = true, Anonymous = false, Callback = function() end },
+    OpenButton = { Enabled = false },
+})
+
+local function applyToggleKey(win, v)
+    local keyName = v
+    if typeof(v) == "EnumItem" then keyName = v.Name end
+    if type(v) ~= "string" then keyName = tostring(v) end
+    if not keyName or keyName == "" then keyName = "F" end
+    S.uiToggleKey = keyName
+    pcall(function() win:SetToggleKey(Enum.KeyCode[keyName]) end)
+end
+pcall(function() applyToggleKey(Window, S.uiToggleKey) end)
+
+local TabMemancing  = Window:Tab({ Title = "Memancing",  Icon = "anchor" })
+local TabHalloween  = Window:Tab({ Title = "Halloween",  Icon = "ghost" })
+local TabPlayer     = Window:Tab({ Title = "Player",     Icon = "users" })
 local TabPengaturan = Window:Tab({ Title = "Pengaturan", Icon = "settings" })
 
-local statusPara = TabMemancing:Paragraph({ Title = "Status", Desc = "Siap" })
-local castPara = TabMemancing:Paragraph({ Title = "Metode Cast Terakhir", Desc = "-" })
+S._statusPara = TabMemancing:Paragraph({
+    Title = "Status",
+    Desc = "Mode: Full | Mati",
+})
 
-local function updateStatusUI()
-    local modeText = S.running and "AFK (Auto Cast + Auto Steer)" or (S.assistSteerOnly and "Assist (Manual Cast + Auto Steer)" or "Idle")
-    local s = "Mode: " .. modeText .. " | Fase: " .. tostring(F.phase or "-")
-    if isTextFocused() then s = s .. " | Pause (chat/fokus)" end
-    if F.steerActive then s = s .. " | Steering" end
-    pcall(function() statusPara:SetDesc(s) end)
-    pcall(function() castPara:SetDesc(tostring(F.lastCastMethod or "-")) end)
-end
-
-TabMemancing:Paragraph({ Title = "Prioritas Utama", Desc = "Auto Cast + Auto Steer terpadu untuk AFK (PC/iOS/Android). Auto steer memakai input arah minigame sesuai mekanik game." })
-
-TabMemancing:Toggle({
-    Title = "Auto Fish AFK (Cast + Steer)",
-    Desc = "Utama: otomatis cast (lempar) dan otomatis kendalikan minigame saat aktif. Bisa ditinggal AFK.",
-    Value = S.running,
-    Callback = function(state)
-        S.running = state and true or false
-        if S.running then
-            S.assistSteerOnly = false
-            F.nextAt = now() + 0.4
-            F.sawMinigame = false; F.busySeen = false; F.pendingCastAt = 0
-        else
-            F.pendingCastAt = 0
-            releaseSteerInput()
-        end
-        updateStatusUI()
-    end
+TabMemancing:Dropdown({
+    Title = "Mode Auto Fishing",
+    Desc = "Full = cast + steer otomatis",
+    Values = { "Full Auto", "Assist (Cast Manual)" },
+    Value = "Full Auto",
+    Callback = function(opt)
+        local v = opt
+        if type(opt) == "table" then v = opt.Title or opt.Value or opt[1] or tostring(opt) end
+        v = tostring(v)
+        S.mode = (string.find(v, "Assist") and "Assist") or "Full"
+        setStatus("Mode: " .. S.mode .. " | " .. (S.running and "Berjalan" or "Mati"))
+    end,
 })
 
 TabMemancing:Toggle({
-    Title = "Assist Steer (Manual Cast)",
-    Desc = "Opsional: jika AFK dimatikan, auto steer tetap membantu saat minigame tampil (kamu cast manual).",
-    Value = S.assistSteerOnly,
+    Title = "Auto Fishing",
+    Desc = "Nyalakan siklus otomatis (cast → minigame → cooldown).",
+    Value = false,
     Callback = function(state)
-        S.assistSteerOnly = state and true or false
-        if S.assistSteerOnly then S.running = false end
-        updateStatusUI()
-    end
+        S.running = state
+        if state then
+            S._wasBusy = false
+            S._sawMinigame = false
+            S._castConfirmed = false
+            S._biteWaitUntil = 0
+            S._nextCastAt = os.clock() + 1
+            setStatus("Mode: " .. S.mode .. " | Berjalan")
+            print("[CloudsHub] auto-fishing ON mode=" .. S.mode)
+        else
+            inputRelease()
+            setStatus("Mode: " .. S.mode .. " | Mati")
+            print("[CloudsHub] auto-fishing OFF")
+        end
+    end,
 })
 
 TabMemancing:Toggle({
     Title = "Auto Steer Minigame",
-    Desc = "Mengendalikan arah bar mengikuti ikan via input hold/lepas (kompatibel dengan minigame game).",
-    Value = S.autoSteer,
+    Desc = "Tahan/lepas otomatis saat minigame (input-only, tanpa hook).",
+    Value = S.steerEnabled,
     Callback = function(state)
-        S.autoSteer = state and true or false
-        if not S.autoSteer then releaseSteerInput() end
-        updateStatusUI()
-    end
+        S.steerEnabled = state
+        if not state then inputRelease() end
+        print("[CloudsHub] steer " .. (state and "enabled" or "disabled"))
+    end,
 })
 
-TabMemancing:Toggle({ Title = "Auto Equip Rod", Desc = "Otomatis equip rod FishingKit jika belum terpegang.", Value = S.autoEquip, Callback = function(state) S.autoEquip = state and true or false end })
+TabMemancing:Dropdown({
+    Title = "Input Steer",
+    Desc = "Mouse = klik-tahan; Space = tombol spasi",
+    Values = { "Mouse", "Space" },
+    Value = S.steerInput,
+    Callback = function(opt)
+        local v = opt
+        if type(opt) == "table" then v = opt.Title or opt.Value or opt[1] or tostring(opt) end
+        v = tostring(v)
+        if string.find(v, "Space", 1, true) then S.steerInput = "Space" else S.steerInput = "Mouse" end
+        inputRelease() -- ganti input saat sedang menahan = lepas dulu
+    end,
+})
 
-TabMemancing:Slider({ Title = "Delay Setelah Ikan Dapat (Post-Minigame)", Desc = "Jeda sebelum cast berikutnya setelah siklus selesai (0.1s).", Step = 0.1, Value = { Min = 0.5, Max = 10.0, Default = S.postDelay }, Callback = function(v)
-    local n = tonumber(type(v) == "table" and (v.Current or v.Value or v.Default) or v)
-    if n then S.postDelay = math.clamp(n, 0.5, 10.0) end
-end })
+TabMemancing:Toggle({
+    Title = "Auto Equip Rod",
+    Desc = "Equip rod otomatis sebelum cast (Areon Rod diprioritaskan).",
+    Value = true,
+    Callback = function(state) S.autoEquip = state end,
+})
 
-TabMemancing:Slider({ Title = "Timeout Retry Cast", Desc = "Jika setelah cast tidak masuk busy/minigame, tunggu lalu retry (0.1s). Default 8.0 detik.", Step = 0.1, Value = { Min = 2.0, Max = 15.0, Default = S.retryDelay }, Callback = function(v)
-    local n = tonumber(type(v) == "table" and (v.Current or v.Value or v.Default) or v)
-    if n then S.retryDelay = math.clamp(n, 2.0, 15.0) end
-end })
+TabMemancing:Button({
+    Title = "Auto Equip Rod Sekarang",
+    Desc = "Equip rod langsung",
+    Callback = function()
+        local ok = ensureRodEquipped()
+        setStatus(ok and "Rod ter-equip" or "Rod tidak ditemukan")
+    end,
+})
 
-TabMemancing:Paragraph({ Title = "Catatan", Desc = "Cast: input klik/tap/tool + tombol Mobile (cross-platform). Steer: input arah minigame. Aksi dipause saat chat/fokus teks." })
+TabMemancing:Slider({
+    Title = "Jeda Setelah Minigame (detik)",
+    Desc = "Tunggu sebelum cast lagi setelah minigame selesai.",
+    Step = 0.1,
+    Value = { Min = 0.5, Max = 10, Default = tonumber(S.postMinigameDelay) },
+    Callback = function(v)
+        local n = tonumber(v)
+        if n then S.postMinigameDelay = math.clamp(n, 0.5, 10) end
+    end,
+})
 
--- Halloween
-TabHalloween:Paragraph({ Title = "ESP Labu (Pumpkin)", Desc = "Highlight + label labu aktif di Workspace.LabuAktif." })
-TabHalloween:Toggle({ Title = "Pumpkin ESP", Desc = "Tandai semua labu aktif. Update otomatis.", Value = S._esp.enabled == true, Callback = function(state) setPumpkinEsp(state) end })
-TabHalloween:Toggle({ Title = "Auto Run ke Labu", Desc = "Jalan otomatis ke labu terdekat (pathfinding, anti-stuck, auto-jump).", Value = S._autoRun.enabled == true, Callback = function(state) if state then startAutoRun() else stopAutoRun() end end })
+TabMemancing:Slider({
+    Title = "Jeda Antar Cast / Retry (detik)",
+    Desc = "Jeda umum antar siklus & retry cast gagal.",
+    Step = 0.1,
+    Value = { Min = 2, Max = 15, Default = tonumber(S.castDelay) },
+    Callback = function(v)
+        local n = tonumber(v)
+        if n then S.castDelay = math.clamp(n, 2, 15) end
+    end,
+})
 
--- Player
-S._spectateStatus = TabPlayer:Paragraph({ Title = "Spectate", Desc = "Target: -" })
-TabPlayer:Button({ Title = "Next Player", Desc = "Spectate pemain berikutnya", Callback = function()
-    local p = spectateStep(1); pcall(function() S._spectateStatus:SetDesc(p and ("Target: " .. (p.DisplayName or p.Name) .. " (@" .. p.Name .. ")") or "Target: -") end)
-end })
-TabPlayer:Button({ Title = "Previous Player", Desc = "Spectate pemain sebelumnya", Callback = function()
-    local p = spectateStep(-1); pcall(function() S._spectateStatus:SetDesc(p and ("Target: " .. (p.DisplayName or p.Name) .. " (@" .. p.Name .. ")") or "Target: -") end)
-end })
-TabPlayer:Button({ Title = "Stop Spectate", Desc = "Kembali ke kamera sendiri", Callback = function()
-    setSpectateTarget(nil); pcall(function() S._spectateStatus:SetDesc("Target: -") end)
-end })
+TabMemancing:Slider({
+    Title = "Bite Timeout (detik)",
+    Desc = "Maksimal menunggu gigitan sebelum cast ulang (anti double-cast).",
+    Step = 1,
+    Value = { Min = 10, Max = 120, Default = tonumber(S.biteTimeout) },
+    Callback = function(v)
+        local n = tonumber(v)
+        if n then S.biteTimeout = math.clamp(n, 10, 120) end
+    end,
+})
 
--- Pengaturan
-TabPengaturan:Toggle({ Title = "Anti-AFK", Desc = "Mencegah idle/kick otomatis saat AFK.", Value = S._antiAfk.enabled == true, Callback = function(state) setAntiAfk(state) end })
-TabPengaturan:Keybind({ Title = "Keybind Tampilkan/Sembunyikan UI", Desc = "Buka/tutup window (default: F, PC). Di mobile gunakan tombol Clouds Hub.", Value = S.uiToggleKey or "F", Callback = function(v) applyToggleKey(Window, v) end })
-applyToggleKey(Window, S.uiToggleKey)
+-- Halloween ------------------------------------------------------------------
+TabHalloween:Paragraph({
+    Title = "Event Labu",
+    Desc = "ESP labu aktif & lari otomatis ke labu terdekat (tanpa teleport).",
+})
 
--- ===== loops =====
-local lastFish, lastUI = 0, 0
-table.insert(S._conns, RunService.RenderStepped:Connect(function()
-    pcall(steerTick)
-end))
-table.insert(S._conns, RunService.Heartbeat:Connect(function()
-    local t = now()
-    if (t - lastFish) >= 0.1 then lastFish = t; pcall(fishingTick) end
-    if (t - lastUI) >= 0.5 then lastUI = t; pcall(updateStatusUI) end
-end))
+TabHalloween:Toggle({
+    Title = "Pumpkin ESP",
+    Desc = "Highlight + label jarak untuk semua labu aktif.",
+    Value = false,
+    Callback = function(state) setPumpkinESP(state) end,
+})
 
--- pastikan input steer dilepas saat reload kondisi aman
-releaseSteerInput()
-updateStatusUI()
-print("[CloudsHub] loaded v2.3.4 (AFK terpadu: auto-equip+cast+steer, cast stabil cross-platform)")
-diag("loaded v2.3.4 running=" .. tostring(S.running) .. " assist=" .. tostring(S.assistSteerOnly) .. " steer=" .. tostring(S.autoSteer) .. " retry=" .. tostring(S.retryDelay))
+TabHalloween:Toggle({
+    Title = "Auto Run ke Labu",
+    Desc = "Pathfinding ke labu terdekat, anti-stuck + auto-jump.",
+    Value = false,
+    Callback = function(state)
+        if state then startAutoRun() else stopAutoRun() end
+    end,
+})
+
+-- Player ---------------------------------------------------------------------
+S._specStatus = TabPlayer:Paragraph({ Title = "Spectate", Desc = "Target: -" })
+
+local specPlayers = {}
+for _, p in ipairs(othersList()) do table.insert(specPlayers, p.Name) end
+if #specPlayers == 0 then specPlayers = { "-" } end
+
+local ddSpectate = TabPlayer:Dropdown({
+    Title = "Select Player",
+    Desc = "Pilih pemain untuk di-spectate",
+    Values = specPlayers,
+    Value = specPlayers[1],
+    Callback = function(opt)
+        local name = opt
+        if type(opt) == "table" then name = opt.Title or opt.Value or opt[1] end
+        name = tostring(name)
+        if name == "-" then return end
+        local target = Players:FindFirstChild(name)
+        if target and target ~= lp then
+            setSpectate(target)
+            pcall(function()
+                S._specStatus:SetDesc("Target: " .. (target.DisplayName or target.Name) .. " (@" .. target.Name .. ")")
+            end)
+        end
+    end,
+})
+
+TabPlayer:Button({
+    Title = "Refresh Daftar Player",
+    Desc = "Muat ulang daftar pemain di dropdown",
+    Callback = function()
+        local names = {}
+        for _, p in ipairs(othersList()) do table.insert(names, p.Name) end
+        if #names == 0 then names = { "-" } end
+        local ok = pcall(function() ddSpectate:Refresh(names) end)
+        if not ok then pcall(function() ddSpectate:Set(names) end) end
+        pcall(function() S._specStatus:SetDesc("Daftar diperbarui (" .. #names .. ")") end)
+    end,
+})
+
+TabPlayer:Button({
+    Title = "Spectate / Stop",
+    Desc = "Spectate target terpilih, klik lagi untuk kembali",
+    Callback = function()
+        if spectate.target then
+            setSpectate(nil)
+            pcall(function() S._specStatus:SetDesc("Target: -") end)
+        else
+            local sel = nil
+            pcall(function()
+                local v = ddSpectate:Get()
+                if type(v) == "table" then v = v.Value or v[1] end
+                if v and v ~= "-" then sel = Players:FindFirstChild(tostring(v)) end
+            end)
+            if not sel then
+                local names = othersList()
+                sel = names[1]
+            end
+            if sel then
+                setSpectate(sel)
+                pcall(function()
+                    S._specStatus:SetDesc("Target: " .. (sel.DisplayName or sel.Name) .. " (@" .. sel.Name .. ")")
+                end)
+            end
+        end
+    end,
+})
+
+TabPlayer:Button({
+    Title = "Next Player",
+    Desc = "Spectate pemain berikutnya",
+    Callback = function()
+        local p = spectateStep(1)
+        pcall(function()
+            S._specStatus:SetDesc(p and ("Target: " .. (p.DisplayName or p.Name)) or "Tidak ada player lain")
+        end)
+    end,
+})
+
+TabPlayer:Button({
+    Title = "Previous Player",
+    Desc = "Spectate pemain sebelumnya",
+    Callback = function()
+        local p = spectateStep(-1)
+        pcall(function()
+            S._specStatus:SetDesc(p and ("Target: " .. (p.DisplayName or p.Name)) or "Tidak ada player lain")
+        end)
+    end,
+})
+
+TabPlayer:Button({
+    Title = "Stop Spectate",
+    Desc = "Kembali ke kamera sendiri",
+    Callback = function()
+        setSpectate(nil)
+        pcall(function() S._specStatus:SetDesc("Target: -") end)
+    end,
+})
+
+-- Pengaturan -----------------------------------------------------------------
+TabPengaturan:Paragraph({
+    Title = "UI",
+    Desc = "Keybind F (PC) atau tombol pill '☁ Clouds Hub' (draggable, semua platform).",
+})
+
+TabPengaturan:Toggle({
+    Title = "Anti-AFK",
+    Desc = "Mencegah kick idle saat AFK mancing.",
+    Value = false,
+    Callback = function(state) setAntiAfk(state) end,
+})
+
+TabPengaturan:Keybind({
+    Title = "Keybind Buka/Tutup UI",
+    Desc = "Default: F (PC)",
+    Value = S.uiToggleKey,
+    Callback = function(v) applyToggleKey(Window, v) end,
+})
+
+TabPengaturan:Toggle({
+    Title = "Tampilkan Tombol Clouds",
+    Desc = "Tombol pill '☁ Clouds Hub' di sisi layar.",
+    Value = S.showPill,
+    Callback = function(state)
+        S.showPill = state
+        pcall(function()
+            local cg = (gethui and gethui()) or game:GetService("CoreGui")
+            local gui = cg:FindFirstChild("CloudsHub_ToggleGui")
+            if gui then gui.Enabled = state end
+        end)
+    end,
+})
+
+TabPengaturan:Button({
+    Title = "Unload Clouds Hub",
+    Desc = "Matikan semua fitur & hapus UI",
+    Callback = function()
+        pcall(function() S.Unload() end)
+    end,
+})
+
+-- ===== 12. Pill toggle (draggable) =========================================
+pcall(function()
+    local host = (gethui and gethui()) or game:GetService("CoreGui")
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CloudsHub_ToggleGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Enabled = S.showPill
+    gui.Parent = host
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "ToggleCloudsHub"
+    btn.Size = UDim2.fromOffset(118, 36)
+    btn.Position = UDim2.new(0, 14, 0.5, -18)
+    btn.BackgroundColor3 = Color3.fromHex("#38bdf8")
+    btn.BackgroundTransparency = 0.08
+    btn.Text = "☁ Clouds Hub"
+    btn.TextColor3 = Color3.fromHex("#f0f9ff")
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    btn.AutoButtonColor = true
+    btn.Active = true
+    btn.Draggable = true
+    btn.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.2
+    stroke.Color = Color3.fromHex("#bae6fd")
+    stroke.Transparency = 0.25
+    stroke.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        pcall(function()
+            if Window and Window.Toggle then Window:Toggle() end
+        end)
+    end)
+end)
+
+-- ===== 13. Unload ==========================================================
+S.Unload = function()
+    S._alive = false
+    S.running = false
+    pcall(function() inputRelease() end)
+    setAntiAfk(false)
+    setPumpkinESP(false)
+    stopAutoRun()
+    setSpectate(nil)
+    for _, c in ipairs(S._conn) do
+        pcall(function() c:Disconnect() end)
+    end
+    S._conn = {}
+    if afkConn then pcall(function() afkConn:Disconnect() end) afkConn = nil end
+    pcall(function()
+        if Window then
+            if Window.Destroy then Window:Destroy() end
+        end
+    end)
+    pcall(function()
+        local host = (gethui and gethui()) or game:GetService("CoreGui")
+        local gui = host:FindFirstChild("CloudsHub_ToggleGui")
+        if gui then gui:Destroy() end
+    end)
+    genv.__CLOUDS_HUB_V3 = nil
+    print("[CloudsHub] V3 unloaded")
+end
+genv.__CLOUDS_HUB_V3 = S
+
+-- Default Anti-AFK ON (untuk AFK mancing)
+setAntiAfk(true)
+
+print("[CloudsHub] loaded V3.0.1 — input-only auto fishing (tanpa debug hook), UI biru langit")
